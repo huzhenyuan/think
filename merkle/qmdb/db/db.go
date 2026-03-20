@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/qmdb/compaction"
 	"github.com/qmdb/crypto"
 	"github.com/qmdb/shard"
 	"github.com/qmdb/types"
@@ -78,7 +79,25 @@ func Open(dataDir string) (*QMDB, error) {
 	if initErr != nil {
 		return nil, initErr
 	}
+
+	// After all shards are initialised, synchronise the UpperTree.
+	// For brand-new shards insertSentinels already called onRootChange inline.
+	// For recovered shards (rebuildFromLog) we replay all twig-root notifications now.
+	for i := 0; i < types.ShardCount; i++ {
+		db.shards[i].EmitTwigRoots()
+	}
+
 	return db, nil
+}
+
+// Close flushes and closes all Shard append logs.
+func (db *QMDB) Close() error {
+	for i := 0; i < types.ShardCount; i++ {
+		if err := db.shards[i].Close(); err != nil {
+			return fmt.Errorf("close shard %d: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // ──────────────────────────── Block lifecycle ─────────────────────────────────
@@ -102,7 +121,15 @@ func (db *QMDB) BeginTx(txIndex uint32) {
 
 // EndBlock finalises the block. Returns the state root (global Merkle root).
 // The state root is always current — no extra computation needed.
+// Compaction is run deterministically here so that every node triggers at the same time.
 func (db *QMDB) EndBlock() crypto.Hash {
+	// Run compaction for every shard. Must be called outside db.mu to avoid deadlock
+	// (compaction calls Shard.Update which triggers onTwigRootChange → upperTree.UpdateTwigRoot).
+	version := db.CurrentVersion()
+	for i := 0; i < types.ShardCount; i++ {
+		_, _ = compaction.RunCompactionIfNeeded(db.shards[i], version)
+	}
+
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	return db.upperTree.StateRoot()
@@ -150,28 +177,13 @@ func (db *QMDB) Set(appKey []byte, value []byte) error {
 }
 
 // SetByStorageKey performs Insert-or-Update using a raw 28-byte storage key.
+// Uses Shard.Upsert which holds the write lock through both the existence check
+// and the write, eliminating the TOCTOU race of a separate Get + Insert/Update.
 func (db *QMDB) SetByStorageKey(key [types.KeySize]byte, value []byte) error {
 	version := db.currentVersion()
-	s := db.shardFor(key)
-
-	// Check existence to decide Insert vs Update.
-	existing, err := s.Get(key)
-	if err != nil {
+	if err := db.shardFor(key).Upsert(key, value, version); err != nil {
 		return err
 	}
-
-	if existing == nil {
-		// Key doesn't exist → Insert.
-		if err := s.Insert(key, value, version); err != nil {
-			return err
-		}
-	} else {
-		// Key exists → Update.
-		if err := s.Update(key, value, version); err != nil {
-			return err
-		}
-	}
-
 	db.notifyObserver("Set", key, version)
 	return nil
 }
@@ -203,15 +215,22 @@ func (db *QMDB) GetAtVersion(appKey []byte, targetVersion types.Version) ([]byte
 
 // ProofForKey constructs the full Merkle proof path for the current version of a key.
 // The proof allows any verifier to confirm the value is included in the state root.
-//
-// Proof structure:
-//  1. Twig-internal proof (11 sibling hashes, from FreshTwig's in-memory Merkle tree).
-//  2. Upper-tree proof (sibling hashes from TwigID to root).
 func (db *QMDB) ProofForKey(appKey []byte) (*MerkleProof, error) {
 	key := crypto.HashAppKey(appKey)
+	return db.proofForStorageKey(key)
+}
+
+// ProofForStorageKey constructs a full Merkle proof for the raw 28-byte storage key.
+// Used internally and by non-existence proofs (predecessor is identified by storage key).
+func (db *QMDB) ProofForStorageKey(key [types.KeySize]byte) (*MerkleProof, error) {
+	return db.proofForStorageKey(key)
+}
+
+// proofForStorageKey is the shared implementation for both proof entry points.
+func (db *QMDB) proofForStorageKey(key [types.KeySize]byte) (*MerkleProof, error) {
 	s := db.shardFor(key)
 
-	// Look up the current entry.
+	// Look up the current entry (acquires+releases shard RLock).
 	entry, err := s.GetEntry(key)
 	if err != nil || entry == nil {
 		return nil, fmt.Errorf("key not found: %x", key)
@@ -221,52 +240,76 @@ func (db *QMDB) ProofForKey(appKey []byte) (*MerkleProof, error) {
 	twigID := entry.TwigID()
 	slot := int(entry.SlotIndex())
 
-	// Step 1: get the twig-internal proof.
-	freshTwig := s.FreshTwigSnapshot()
-	if freshTwig.TwigID != twigID {
-		// Entry is in a Full Twig — would need to read from CSV and rebuild.
-		// For this implementation we return a partial proof.
-		return &MerkleProof{
-			EntryID:        entry.Id,
-			Key:            key,
-			Value:          entry.Value,
-			Version:        entry.Version,
-			TwigID:         twigID,
-			SlotIndex:      slot,
-			ShardID:        shardID,
-			TwigProof:      nil, // requires CSV re-read (see Twig.RebuildFromLeaves)
-			UpperTreeProof: nil,
-			StateRoot:      db.upperTree.StateRoot(),
-			IsPartial:      true,
-		}, nil
-	}
-
-	twigProof := freshTwig.MerkleProof(slot)
-	upperProof, err := db.upperTree.MerklePathForTwig(shardID, twigID)
-	if err != nil {
-		return nil, err
-	}
-
 	leafHash := crypto.HashEntry(
 		entry.Id, entry.Key[:], entry.Value, entry.NextKey[:],
 		entry.OldId, entry.OldNextKeyId,
 		uint64(entry.Version), entry.IsDeleted,
 	)
 
+	upperProof, err := db.upperTree.MerklePathForTwig(shardID, twigID)
+	if err != nil {
+		return nil, err
+	}
+
+	upperLeafPos, upperLeafCount := db.upperTree.LeafPosForTwig(shardID, twigID)
+
+	// Fresh Twig: all Merkle nodes are in memory — zero disk I/O.
+	freshTwig := s.FreshTwigSnapshot()
+	if freshTwig.TwigID == twigID {
+		twigProof := freshTwig.MerkleProof(slot)
+		return &MerkleProof{
+			EntryID:            entry.Id,
+			Key:                key,
+			Value:              entry.Value,
+			NextKey:            entry.NextKey,
+			OldId:              entry.OldId,
+			OldNextKeyId:       entry.OldNextKeyId,
+			Version:            entry.Version,
+			TwigID:             twigID,
+			SlotIndex:          slot,
+			ShardID:            shardID,
+			LeafHash:           leafHash,
+			TwigProof:          twigProof,
+			UpperTreeProof:     upperProof,
+			UpperTreeLeafPos:   upperLeafPos,
+			UpperTreeLeafCount: upperLeafCount,
+			StateRoot:          db.upperTree.StateRoot(),
+			IsPartial:          false,
+		}, nil
+	}
+
+	// Full Twig: rebuild internal Merkle tree from CSV (1 sequential read per slot).
+	twigProof, err := s.BuildProofForFullTwig(twigID, slot)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild full twig proof: %w", err)
+	}
+
 	return &MerkleProof{
-		EntryID:        entry.Id,
-		Key:            key,
-		Value:          entry.Value,
-		Version:        entry.Version,
-		TwigID:         twigID,
-		SlotIndex:      slot,
-		ShardID:        shardID,
-		LeafHash:       leafHash,
-		TwigProof:      twigProof,
-		UpperTreeProof: upperProof,
-		StateRoot:      db.upperTree.StateRoot(),
-		IsPartial:      false,
+		EntryID:            entry.Id,
+		Key:                key,
+		Value:              entry.Value,
+		NextKey:            entry.NextKey,
+		OldId:              entry.OldId,
+		OldNextKeyId:       entry.OldNextKeyId,
+		Version:            entry.Version,
+		TwigID:             twigID,
+		SlotIndex:          slot,
+		ShardID:            shardID,
+		LeafHash:           leafHash,
+		TwigProof:          twigProof,
+		UpperTreeProof:     upperProof,
+		UpperTreeLeafPos:   upperLeafPos,
+		UpperTreeLeafCount: upperLeafCount,
+		StateRoot:          db.upperTree.StateRoot(),
+		IsPartial:          false,
 	}, nil
+}
+
+// FindPredecessorEntry returns the entry for the largest active key strictly less
+// than HashAppKey(appKey). Used to build non-existence proofs.
+func (db *QMDB) FindPredecessorEntry(appKey []byte) (*types.Entry, error) {
+	key := crypto.HashAppKey(appKey)
+	return db.shardFor(key).FindPredecessorEntry(key)
 }
 
 // ──────────────────────────── Inspection helpers ──────────────────────────────
@@ -315,46 +358,58 @@ func (db *QMDB) notifyObserver(op string, key [types.KeySize]byte, version types
 
 // ──────────────────────────── MerkleProof ─────────────────────────────────────
 
-// MerkleProof holds a complete (or partial) proof that an Entry is included
-// in the global state root.
+// MerkleProof holds a complete proof that an Entry is included in the global state root.
 type MerkleProof struct {
-	EntryID   uint64
-	Key       [types.KeySize]byte
-	Value     []byte
-	Version   types.Version
-	TwigID    uint64
-	SlotIndex int
-	ShardID   int
-	LeafHash  crypto.Hash
+	EntryID      uint64
+	Key          [types.KeySize]byte
+	Value        []byte
+	NextKey      [types.KeySize]byte
+	OldId        uint64
+	OldNextKeyId uint64
+	Version      types.Version
+	TwigID       uint64
+	SlotIndex    int
+	ShardID      int
+	LeafHash     crypto.Hash
 
-	// TwigProof: 11 sibling hashes from leaf to Twig root.
+	// TwigProof: TwigMerkleDepth (11) sibling hashes from leaf to Twig root.
 	TwigProof []crypto.Hash
 
 	// UpperTreeProof: sibling hashes from Twig root to global state root.
 	UpperTreeProof []crypto.Hash
 
+	// UpperTreeLeafPos is the 0-based leaf position of this Twig in the upper tree.
+	// UpperTreeLeafCount is the total leaf count (ShardCount * maxTwigsPerShard) at proof time.
+	// Both are needed by Verify() to reproduce the heap-index walk correctly.
+	UpperTreeLeafPos   int
+	UpperTreeLeafCount int
+
 	StateRoot crypto.Hash
-	IsPartial bool // true if TwigProof couldn't be computed (Full Twig)
+	IsPartial bool // always false in this implementation (Full Twig proofs are now supported)
 }
 
 // Verify checks the proof against the provided state root.
+// Returns true if the proof walks correctly from the entry's leaf hash to expectedRoot.
 func (p *MerkleProof) Verify(expectedRoot crypto.Hash) bool {
 	if p.IsPartial {
 		return false
 	}
 
-	// Step 1: recompute leaf hash from entry data.
+	// Step 1: recompute the leaf hash from the full entry data in the proof.
 	recomputed := crypto.HashEntry(
-		p.EntryID, p.Key[:], p.Value, make([]byte, types.KeySize),
-		types.NullEntryID, types.NullEntryID,
+		p.EntryID, p.Key[:], p.Value, p.NextKey[:],
+		p.OldId, p.OldNextKeyId,
 		uint64(p.Version), false,
 	)
-	// Note: in a full verify we'd use the actual NextKey/OldId from the proof.
-	// For now just verify structure.
-	_ = recomputed
+	if recomputed != p.LeafHash {
+		return false
+	}
 
 	current := p.LeafHash
-	// Walk Twig-internal proof.
+
+	// Step 2: walk the twig-internal proof (leaf → twig root).
+	// Heap index of the leaf: TwigSize + slot. Since TwigSize = 2048 (even),
+	// parity at each level is determined solely by the slot value divided by 2^level.
 	slot := p.SlotIndex
 	for _, sibling := range p.TwigProof {
 		if slot%2 == 0 {
@@ -365,8 +420,11 @@ func (p *MerkleProof) Verify(expectedRoot crypto.Hash) bool {
 		slot /= 2
 	}
 
-	// Walk upper-tree proof.
-	leafPos := p.ShardID*64 + int(p.TwigID) // simplified
+	// Step 3: walk the upper-tree proof (twig root → global state root).
+	// Heap index of the twig leaf: leafCount + leafPos.  leafCount is always
+	// ShardCount * maxTwigsPerShard = 16 * 2^k, which is always even at every
+	// level we traverse, so parity is determined solely by leafPos / 2^level.
+	leafPos := p.UpperTreeLeafPos
 	for _, sibling := range p.UpperTreeProof {
 		if leafPos%2 == 0 {
 			current = crypto.HashPair(current, sibling)

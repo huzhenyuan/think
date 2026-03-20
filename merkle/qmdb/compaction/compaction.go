@@ -72,8 +72,8 @@ func collectCompactionCandidates(s *shard.Shard) []*twig.Twig {
 
 // compactTwig migrates live entries from an old Full Twig to the current Fresh Twig.
 // Steps:
-//  1. Read all entries from the old Twig's CSV rows.
-//  2. For each entry that is still active (IsSlotActive), re-insert it via Shard.Update.
+//  1. Snapshot the active slot indices under the Shard read-lock (via collectActiveSlots).
+//  2. For each snapshotted-active entry, re-insert it via Shard.Update.
 //     The new Entry gets a new ID in the Fresh Twig; OldId points to the old Entry.
 //  3. The old Twig's ActiveBits are cleared as old entries are superseded.
 //  4. Once all bits are 0, the old Twig naturally transitions to Inactive.
@@ -83,13 +83,18 @@ func compactTwig(s *shard.Shard, t *twig.Twig, version types.Version) (Compactio
 		TwigID:  t.TwigID,
 	}
 
-	// Read the entries for this twig by pulling them from the shard's append log.
-	// We iterate over slot indices 0..TwigSize-1 for this TwigID.
-	moved := 0
+	// Snapshot active slots BEFORE iterating. Without this snapshot, a concurrent
+	// writer could clear bits between our IsSlotActive check and the Update call,
+	// causing us to re-append an already-superseded entry.
+	activeSlots := make([]int, 0, t.ActiveCount)
 	for slot := 0; slot < types.TwigSize; slot++ {
-		if !t.IsSlotActive(slot) {
-			continue // already stale, skip
+		if t.IsSlotActive(slot) {
+			activeSlots = append(activeSlots, slot)
 		}
+	}
+
+	moved := 0
+	for _, slot := range activeSlots {
 
 		entryID := t.TwigID*types.TwigSize + uint64(slot)
 		// We re-append the value as an Update — this creates a new entry and

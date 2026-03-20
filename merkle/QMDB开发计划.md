@@ -183,3 +183,45 @@ Snapshot() int / RevertToSnapshot(id int)
 ---
 
 计划已保存。请确认方案，或提出调整意见，确认后即可进入实现阶段。
+
+
+```mermaid
+---
+title: OIP 模块化合规引擎堆栈
+---
+flowchart BT
+    subgraph L1[底层共识层]
+        direction TB
+        Base1[Orqus 区块链网络]
+        Base2[Rust 预编译执行引擎]
+        Base3[0x6f20 确定性地址]
+        Base4[OIP20 Gas 支付机制]
+    end
+
+    subgraph L2[OIP 协议规则层]
+        direction TB
+        Proto1["OIP-20 代币标准<br/>ERC-20 严格超集"]
+        Proto2[OIP-451 合规策略注册表]
+        Proto3[OIP-20 Factory 发行工厂]
+        Proto4[角色权限与合规管控]
+    end
+
+    subgraph L3[顶层业务应用层]
+        direction TB
+        App1[OIP20合规稳定币]
+        App2[自定义合规代币发行]
+        App3[带备注链上转账]
+        App4[以太坊生态无缝兼容]
+    end
+
+    L1 --> L2
+    L2 --> L3
+
+    classDef layer1 fill:#e6f7ff,stroke:#1890ff,stroke-width:1.5px
+    classDef layer2 fill:#fff7e6,stroke:#fa8c16,stroke-width:1.5px
+    classDef layer3 fill:#f0f2ff,stroke:#597ef7,stroke-width:1.5px
+
+    class L1 layer1
+    class L2 layer2
+    class L3 layer3
+```

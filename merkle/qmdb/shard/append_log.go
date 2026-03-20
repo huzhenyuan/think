@@ -9,12 +9,15 @@
 package shard
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/qmdb/types"
 )
@@ -36,6 +39,12 @@ var csvHeader = []string{
 // AppendLog is a CSV-backed sequential append log for one Shard.
 // It simulates the role of an NVMe SSD append file in the real QMDB.
 type AppendLog struct {
+	// mu serialises all file handle operations.
+	// Shard.Append is always called under the Shard write lock, so it is already
+	// sequentialised. ReadEntry, however, can be called under a Shard read lock,
+	// allowing concurrent goroutines to seek the same file handle. mu prevents that race.
+	mu sync.Mutex
+
 	// filePath is the path to the CSV file.
 	filePath string
 
@@ -104,7 +113,12 @@ func NewAppendLog(filePath string) (*AppendLog, error) {
 }
 
 // Append writes a new Entry as a CSV row. Returns the byte offset of the written row.
+// Must be called with the Shard write lock held; the AppendLog mutex is also acquired
+// to maintain the invariant that the file cursor is at EOF between writes.
 func (al *AppendLog) Append(e *types.Entry) (int64, error) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+
 	row := entryToCSVRow(e)
 	offset := al.nextOffset
 
@@ -130,8 +144,15 @@ func (al *AppendLog) Append(e *types.Entry) (int64, error) {
 }
 
 // ReadEntry reads and parses the Entry with the given ID by seeking to its CSV row.
-// Returns nil if the entry ID is not found.
+// Returns an error if the entry ID is not found.
 func (al *AppendLog) ReadEntry(entryID uint64) (*types.Entry, error) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+	return al.readEntryLocked(entryID)
+}
+
+// readEntryLocked is the implementation of ReadEntry; caller must hold al.mu.
+func (al *AppendLog) readEntryLocked(entryID uint64) (*types.Entry, error) {
 	offset, ok := al.offsetTable[entryID]
 	if !ok {
 		return nil, fmt.Errorf("entry ID %d not found in append log", entryID)
@@ -157,8 +178,12 @@ func (al *AppendLog) ReadEntry(entryID uint64) (*types.Entry, error) {
 	return csvRowToEntry(row)
 }
 
-// ReadAllEntries reads all entries from the CSV file in order. Used by Compaction.
+// ReadAllEntries reads all entries from the CSV file in order. Used by Compaction
+// and startup recovery.
 func (al *AppendLog) ReadAllEntries() ([]*types.Entry, error) {
+	al.mu.Lock()
+	defer al.mu.Unlock()
+
 	if _, err := al.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -208,42 +233,46 @@ func (al *AppendLog) RowCount() int64 {
 // ──────────────────────────── helpers ────────────────────────────────────────
 
 // rebuildOffsetTable scans the CSV file from the start and rebuilds offsetTable.
+// Uses a bufio.Scanner line-by-line to correctly track byte offsets, avoiding
+// the csv.Reader buffering problem where the underlying file position jumps ahead.
 func (al *AppendLog) rebuildOffsetTable() error {
-	if _, err := al.file.Seek(0, io.SeekStart); err != nil {
+	// Open a fresh read-only descriptor so the write cursor is undisturbed.
+	f, err := os.Open(al.filePath)
+	if err != nil {
 		return err
 	}
-	r := csv.NewReader(al.file)
-	r.FieldsPerRecord = len(csvHeader)
+	defer f.Close()
 
-	// Skip header row; record only its size.
-	if _, err := r.Read(); err != nil {
-		return err
+	scanner := bufio.NewScanner(f)
+	// A generous buffer: value field is 224 bytes = 448 hex chars, total row ≈ 700 chars.
+	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+
+	var offset int64
+
+	// Skip header line.
+	if !scanner.Scan() {
+		return scanner.Err()
 	}
+	offset += int64(len(scanner.Bytes())) + 1 // +1 for '\n'
 
-	for {
-		before, err := al.file.Seek(0, io.SeekCurrent)
-		if err != nil {
-			return err
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		rowOffset := offset
+		offset += int64(len(line)) + 1
+
+		// Parse entry_id from the first comma-delimited field.
+		commaIdx := bytes.IndexByte(line, ',')
+		if commaIdx < 0 {
+			continue
 		}
-		// We need byte offsets per row. csv.Reader doesn't expose them natively,
-		// so we track position before each Read.
-		// NOTE: r.Read() may buffer; this approach under-counts when buffering occurs.
-		// For correctness we re-open as needed via direct seeks.
-		row, err := r.Read()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return err
-		}
-		idVal, err := strconv.ParseUint(row[0], 10, 64)
+		id, err := strconv.ParseUint(string(line[:commaIdx]), 10, 64)
 		if err != nil {
 			continue
 		}
-		al.offsetTable[idVal] = before
+		al.offsetTable[id] = rowOffset
 		al.rowCount++
 	}
-	return nil
+	return scanner.Err()
 }
 
 // entryToCSVRow serializes an Entry into CSV columns.

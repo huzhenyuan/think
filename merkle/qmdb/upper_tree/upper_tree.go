@@ -231,6 +231,15 @@ func (ut *UpperTree) NodeCount() int {
 	return len(ut.nodes)
 }
 
+// LeafPosForTwig returns the 0-based leaf position of (shardID, twigID) within the upper
+// tree's leaf array, plus the current leafCount.
+// The verifier needs both values to simulate the heap-index walk during Verify().
+func (ut *UpperTree) LeafPosForTwig(shardID int, twigID uint64) (leafPos int, leafCount int) {
+	ut.mu.RLock()
+	defer ut.mu.RUnlock()
+	return ut.leafPosition(shardID, twigID), ut.leafCount
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers (all callers must hold mu appropriately)
 // ─────────────────────────────────────────────────────────────────────────────

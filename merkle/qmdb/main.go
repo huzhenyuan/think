@@ -179,6 +179,14 @@ func main() {
 			len(proof.TwigProof), len(proof.UpperTreeProof))
 		fmt.Printf("  state root in proof: %s\n", hexShort(proof.StateRoot[:]))
 		fmt.Printf("  partial (in Full Twig): %v\n", proof.IsPartial)
+
+		// Verify the proof against the current state root.
+		currentRoot := qmdb.StateRoot()
+		if proof.Verify(currentRoot) {
+			fmt.Println("  proof.Verify(): ✓ valid")
+		} else {
+			fmt.Println("  proof.Verify(): ✗ INVALID (bug)")
+		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════

@@ -57,9 +57,6 @@ func (t *QMDBTrie) Prove(key []byte, proofDB ProofWriter) error {
 	if err != nil {
 		return fmt.Errorf("Prove: %w", err)
 	}
-	if proof.IsPartial {
-		return fmt.Errorf("Prove: entry is in a Full Twig; full proof requires CSV rebuild")
-	}
 
 	// Encode proof nodes into proofDB (simplified: store each sibling hash).
 	// In production, this would follow the Ethereum proof encoding (RLP trie nodes).
@@ -86,9 +83,23 @@ func (t *QMDBTrie) Prove(key []byte, proofDB ProofWriter) error {
 }
 
 // ProveNonExistence constructs a non-existence proof for the given key.
-// Returns the predecessor entry (predecessor.Key < key ≤ predecessor.NextKey).
+//
+// Proof structure: find the predecessor P such that P.Key < key ≤ P.NextKey,
+// then provide the full Merkle proof for P. Any verifier can confirm:
+//  1. P is genuinely in the state (Merkle proof checks out against state root).
+//  2. P.NextKey > key, so there is no entry between P and P.NextKey.
+//
+// The following fields are written to proofDB:
+//
+//	non_existence_key — the queried key (raw bytes)
+//	pred_key          — predecessor's storage key (28 bytes)
+//	pred_next_key     — predecessor's NextKey (28 bytes), proves the gap
+//	pred_leaf_hash    — leaf hash of the predecessor entry
+//	pred_twig_proof_N — sibling hashes of the twig-internal proof
+//	pred_upper_proof_N — sibling hashes of the upper-tree proof
+//	state_root        — state root at proof time
 func (t *QMDBTrie) ProveNonExistence(key []byte, proofDB ProofWriter) error {
-	// Check that the key genuinely does not exist.
+	// 1. Confirm non-existence.
 	val, err := t.Get(key)
 	if err != nil {
 		return err
@@ -97,17 +108,45 @@ func (t *QMDBTrie) ProveNonExistence(key []byte, proofDB ProofWriter) error {
 		return fmt.Errorf("ProveNonExistence: key %x actually exists", key)
 	}
 
-	// The proof is: find the predecessor Key P such that P < key < P.NextKey.
-	// Provide a Merkle proof for P, which implicitly proves key is absent.
-	proof, err := t.qmdb.ProofForKey(key) // will fail for non-existent key
-	_ = proof
+	// 2. Find P: the predecessor entry (P.Key < key ≤ P.NextKey).
+	predEntry, err := t.qmdb.FindPredecessorEntry(key)
 	if err != nil {
-		// The key doesn't exist, so we need to prove the predecessor.
-		// For the demo, we record metadata in proofDB.
-		if err2 := proofDB.Put([]byte("non_existence_key"), key); err2 != nil {
-			return err2
+		return fmt.Errorf("ProveNonExistence: find predecessor: %w", err)
+	}
+
+	// 3. Generate the full Merkle proof for P.
+	predProof, err := t.qmdb.ProofForStorageKey(predEntry.Key)
+	if err != nil {
+		return fmt.Errorf("ProveNonExistence: proof for predecessor: %w", err)
+	}
+
+	// 4. Write all proof components into proofDB.
+	if err := proofDB.Put([]byte("non_existence_key"), key); err != nil {
+		return err
+	}
+	if err := proofDB.Put([]byte("pred_key"), predEntry.Key[:]); err != nil {
+		return err
+	}
+	if err := proofDB.Put([]byte("pred_next_key"), predEntry.NextKey[:]); err != nil {
+		return err
+	}
+	if err := proofDB.Put([]byte("pred_leaf_hash"), predProof.LeafHash[:]); err != nil {
+		return err
+	}
+	for i, h := range predProof.TwigProof {
+		nodeKey := fmt.Sprintf("pred_twig_proof_%d", i)
+		if err := proofDB.Put([]byte(nodeKey), h[:]); err != nil {
+			return err
 		}
-		return nil
+	}
+	for i, h := range predProof.UpperTreeProof {
+		nodeKey := fmt.Sprintf("pred_upper_proof_%d", i)
+		if err := proofDB.Put([]byte(nodeKey), h[:]); err != nil {
+			return err
+		}
+	}
+	if err := proofDB.Put([]byte("state_root"), predProof.StateRoot[:]); err != nil {
+		return err
 	}
 	return nil
 }

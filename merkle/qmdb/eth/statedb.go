@@ -10,7 +10,6 @@
 package eth
 
 import (
-	"encoding/binary"
 	"fmt"
 
 	"github.com/qmdb/crypto"
@@ -55,6 +54,14 @@ type QMDBStateDB struct {
 	// current journal (flushed to snapshots on Snapshot()).
 	journal []journalEntry
 
+	// journaledAddrs is the O(1) lookup set for the current-window journal.
+	// Reset whenever s.journal is cleared (Snapshot, Finalise, RevertToSnapshot).
+	journaledAddrs map[Address]bool
+
+	// lastErr captures the first error from Finalise writes (QMDB operations).
+	// Callers should check Err() after Finalise / Commit.
+	lastErr error
+
 	// currentTxHash is the hash of the currently-executing transaction.
 	currentTxHash Hash
 
@@ -68,10 +75,14 @@ type QMDBStateDB struct {
 // NewQMDBStateDB creates a new StateDB backed by the given QMDB instance.
 func NewQMDBStateDB(qmdb *db.QMDB) *QMDBStateDB {
 	return &QMDBStateDB{
-		qmdb:    qmdb,
-		pending: make(map[Address]*pendingAccount),
+		qmdb:           qmdb,
+		pending:        make(map[Address]*pendingAccount),
+		journaledAddrs: make(map[Address]bool),
 	}
 }
+
+// Err returns the first error that occurred during Finalise/Commit, if any.
+func (s *QMDBStateDB) Err() error { return s.lastErr }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Account existence
@@ -262,10 +273,13 @@ func (s *QMDBStateDB) Prepare(txHash Hash, txIndex int) {
 
 // Finalise flushes all pending changes to the underlying QMDB.
 // This is called at the end of each transaction (or block, depending on EVM version).
+// Any QMDB write error is stored in s.lastErr (check with Err()).
 func (s *QMDBStateDB) Finalise(deleteEmptyObjects bool) {
 	for addr, p := range s.pending {
 		if p.deleted || (deleteEmptyObjects && isEmptyAccount(&p.account)) {
-			_ = s.qmdb.DeleteByStorageKey(addrToStorageKey(addr))
+			if err := s.qmdb.DeleteByStorageKey(addrToStorageKey(addr)); err != nil && s.lastErr == nil {
+				s.lastErr = fmt.Errorf("Finalise delete %x: %w", addr, err)
+			}
 			continue
 		}
 
@@ -273,12 +287,16 @@ func (s *QMDBStateDB) Finalise(deleteEmptyObjects bool) {
 		// current block/tx context (set by BeginBlock + BeginTx / Prepare).
 		key := addrToStorageKey(addr)
 		encoded := encodeAccount(&p.account)
-		_ = s.qmdb.SetByStorageKey(key, encoded)
+		if err := s.qmdb.SetByStorageKey(key, encoded); err != nil && s.lastErr == nil {
+			s.lastErr = fmt.Errorf("Finalise set account %x: %w", addr, err)
+		}
 
 		// Flush code if set.
 		if p.codeSet {
 			codeKey := codeStorageKey(p.account.CodeHash)
-			_ = s.qmdb.SetByStorageKey(codeKey, p.code)
+			if err := s.qmdb.SetByStorageKey(codeKey, p.code); err != nil && s.lastErr == nil {
+				s.lastErr = fmt.Errorf("Finalise set code %x: %w", addr, err)
+			}
 		}
 
 		// Flush contract storage slots.
@@ -286,16 +304,21 @@ func (s *QMDBStateDB) Finalise(deleteEmptyObjects bool) {
 			storageKey := storageSlotKey(addr, slot)
 			var zero Hash
 			if value == zero {
-				_ = s.qmdb.DeleteByStorageKey(storageKey)
+				if err := s.qmdb.DeleteByStorageKey(storageKey); err != nil && s.lastErr == nil {
+					s.lastErr = fmt.Errorf("Finalise delete slot %x/%x: %w", addr, slot, err)
+				}
 			} else {
-				_ = s.qmdb.SetByStorageKey(storageKey, value[:])
+				if err := s.qmdb.SetByStorageKey(storageKey, value[:]); err != nil && s.lastErr == nil {
+					s.lastErr = fmt.Errorf("Finalise set slot %x/%x: %w", addr, slot, err)
+				}
 			}
 		}
 	}
 
-	// Clear pending state.
+	// Clear pending state and current-window journal tracking.
 	s.pending = make(map[Address]*pendingAccount)
 	s.journal = nil
+	s.journaledAddrs = make(map[Address]bool)
 }
 
 // IntermediateRoot computes the current state root after applying pending changes.
@@ -308,12 +331,20 @@ func (s *QMDBStateDB) IntermediateRoot(deleteEmptyObjects bool) Hash {
 }
 
 // Commit finalises the block and returns the state root.
+// BeginBlock must be called on the underlying QMDB before any writes for this block.
+// If it has not been called yet (s.currentBlock != block), Commit calls it automatically.
+// This avoids resetting currentTx to 0 in the middle of an already-started block.
 func (s *QMDBStateDB) Commit(block uint64) (Hash, error) {
-	s.currentBlock = block
-	s.qmdb.BeginBlock(block)
-	root := s.IntermediateRoot(true)
-	_ = s.qmdb.EndBlock()
-	return root, nil
+	if s.currentBlock != block {
+		// Standalone use: the caller didn't call BeginBlock externally.
+		s.qmdb.BeginBlock(block)
+		s.currentBlock = block
+	}
+	s.Finalise(true)
+	finalRoot := s.qmdb.EndBlock()
+	var h Hash
+	copy(h[:], finalRoot[:])
+	return h, s.Err()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -328,6 +359,7 @@ func (s *QMDBStateDB) Snapshot() int {
 	copy(journalCopy, s.journal)
 	s.snapshots = append(s.snapshots, journalCopy)
 	s.journal = nil
+	s.journaledAddrs = make(map[Address]bool)
 	return id
 }
 
@@ -361,6 +393,7 @@ func (s *QMDBStateDB) RevertToSnapshot(id int) {
 
 	s.snapshots = s.snapshots[:id+1]
 	s.journal = nil
+	s.journaledAddrs = make(map[Address]bool)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -399,13 +432,13 @@ func (s *QMDBStateDB) getOrCreatePending(addr Address) *pendingAccount {
 
 // journalBefore records the pre-change state of addr for potential revert.
 // Only the first modification within a snapshot period is recorded.
+// Uses an O(1) map lookup instead of scanning the journal slice.
 func (s *QMDBStateDB) journalBefore(addr Address) {
-	// Check if already journaled in this snapshot period.
-	for _, j := range s.journal {
-		if j.addr == addr {
-			return
-		}
+	if s.journaledAddrs[addr] {
+		return
 	}
+	s.journaledAddrs[addr] = true
+
 	var prev *pendingAccount
 	if p, ok := s.pending[addr]; ok {
 		// Deep copy.
@@ -445,11 +478,4 @@ func codeStorageKey(codeHash Hash) [types.KeySize]byte {
 	buf = append(buf, []byte("code:")...)
 	buf = append(buf, codeHash[:]...)
 	return crypto.HashAppKey(buf)
-}
-
-// uint64ToBytes converts a uint64 to an 8-byte big-endian slice.
-func uint64ToBytes(v uint64) []byte {
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, v)
-	return b
 }

@@ -24,6 +24,13 @@ import (
 // The db layer uses this to update the upper Merkle tree.
 type RootChangeCallback func(shardID int, twigID uint64, newTwigRoot crypto.Hash)
 
+// deletedKeyRecord holds the last-known entry ID and deletion version for a deleted key.
+// Used by GetAtVersion to walk history for keys that have been removed.
+type deletedKeyRecord struct {
+	lastEntryID     uint64
+	deletionVersion types.Version
+}
+
 // Shard encapsulates all state for one of the 16 QMDB shards.
 type Shard struct {
 	mu sync.RWMutex
@@ -40,16 +47,18 @@ type Shard struct {
 	// freshTwig is the Twig currently receiving new entries. Always exactly one per Shard.
 	freshTwig *twig.Twig
 
-	// twigs stores all Full and Inactive Twigs (288 B each) by TwigID.
-	// Fresh Twig is in freshTwig, not here.
+	// twigs stores all Full twigs (288 B each) by TwigID.
+	// Inactive twigs are promoted to prunedTwigRoots and removed from here.
 	twigs map[uint64]*twig.Twig
 
+	// prunedTwigRoots holds the root hash of twigs that have been pruned from memory
+	// (all entries superseded). The root hash is still needed by the UpperTree.
+	prunedTwigRoots map[uint64]crypto.Hash
+
 	// nextEntryID is the global entry ID counter for this Shard.
-	// Real QMDB uses a global counter; here it is per-Shard for simplicity.
 	nextEntryID uint64
 
 	// onRootChange is called after every write that updates the Twig root.
-	// The upper tree hooks in here.
 	onRootChange RootChangeCallback
 
 	// nextTwigID is the TwigID that will be assigned to the next Fresh Twig.
@@ -57,6 +66,18 @@ type Shard struct {
 
 	// totalEntryCount counts all entries ever appended (including superseded ones).
 	totalEntryCount int64
+
+	// freshInactiveSlots records slot indices in the current Fresh Twig that have been
+	// superseded by a newer entry. Applied when the Fresh Twig is sealed.
+	freshInactiveSlots []int
+
+	// deletedKeys maps deleted storage keys to their last entry ID + deletion version.
+	deletedKeys map[[types.KeySize]byte]deletedKeyRecord
+
+	// lifecycleBreaks records deletion events for keys that have since been re-inserted.
+	// Needed to answer GetAtVersion queries that fall within a "deleted window" of a
+	// multi-lifecycle key (insert → delete → re-insert).
+	lifecycleBreaks map[[types.KeySize]byte][]deletedKeyRecord
 }
 
 // NewShard creates a new empty Shard.
@@ -69,21 +90,29 @@ func NewShard(shardID int, dataDir string, onRootChange RootChangeCallback) (*Sh
 	}
 
 	s := &Shard{
-		shardID:      shardID,
-		index:        NewBTreeIndex(),
-		log:          al,
-		twigs:        make(map[uint64]*twig.Twig),
-		onRootChange: onRootChange,
+		shardID:         shardID,
+		index:           NewBTreeIndex(),
+		log:             al,
+		twigs:           make(map[uint64]*twig.Twig),
+		prunedTwigRoots: make(map[uint64]crypto.Hash),
+		onRootChange:    onRootChange,
+		deletedKeys:     make(map[[types.KeySize]byte]deletedKeyRecord),
+		lifecycleBreaks: make(map[[types.KeySize]byte][]deletedKeyRecord),
 	}
 
 	// Create the initial Fresh Twig (TwigID = 0).
 	s.freshTwig = twig.NewFreshTwig(0, shardID)
 	s.nextTwigID = 1
 
-	// Seed the ordered linked list with MIN and MAX sentinel entries.
 	if al.RowCount() == 0 {
+		// Brand-new shard: seed with MIN/MAX sentinels.
 		if err := s.insertSentinels(); err != nil {
 			return nil, fmt.Errorf("shard %d insert sentinels: %w", shardID, err)
+		}
+	} else {
+		// Existing data: rebuild all in-memory state from the CSV log.
+		if err := s.rebuildFromLog(); err != nil {
+			return nil, fmt.Errorf("shard %d rebuild: %w", shardID, err)
 		}
 	}
 
@@ -136,9 +165,16 @@ func (s *Shard) GetAtVersion(key [types.KeySize]byte, targetVersion types.Versio
 
 	entryID, found := s.index.Lookup(key)
 	if !found {
-		// Key might have been deleted; we still need to walk history.
-		// For simplicity, return nil for now (production would need a separate deleted-key index).
-		return nil, nil
+		// Key was deleted: check the deleted-key index for historical lookups.
+		rec, deleted := s.deletedKeys[key]
+		if !deleted {
+			return nil, nil
+		}
+		// If the target version is at or after deletion, the key didn't exist.
+		if targetVersion >= rec.deletionVersion {
+			return nil, nil
+		}
+		entryID = rec.lastEntryID
 	}
 
 	// Walk the OldId chain to find the version at targetVersion.
@@ -151,6 +187,14 @@ func (s *Shard) GetAtVersion(key [types.KeySize]byte, targetVersion types.Versio
 			if e.IsDeleted {
 				return nil, nil
 			}
+			// Before returning, check whether this key was deleted during the
+			// window (e.Version, targetVersion]. This handles multi-lifecycle keys
+			// where the OldId chain skips over a deletion event.
+			for _, br := range s.lifecycleBreaks[key] {
+				if e.Version < br.deletionVersion && br.deletionVersion <= targetVersion {
+					return nil, nil
+				}
+			}
 			return e.Value, nil
 		}
 		entryID = e.OldId
@@ -161,52 +205,53 @@ func (s *Shard) GetAtVersion(key [types.KeySize]byte, targetVersion types.Versio
 // ──────────────────────────── Public write operations ────────────────────────
 
 // Insert creates a new key-value pair. The key must not already exist.
-// Maintenance of the ordered NextKey linked list requires:
-//  1. Reading the predecessor entry (1 CSV read).
-//  2. Appending a new Entry for the new key.
-//  3. Appending a new version of the predecessor (updated NextKey).
 func (s *Shard) Insert(key [types.KeySize]byte, value []byte, version types.Version) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.insertLocked(key, value, version)
+}
 
+// insertLocked is the implementation of Insert; caller must hold s.mu write lock.
+func (s *Shard) insertLocked(key [types.KeySize]byte, value []byte, version types.Version) error {
 	if _, found := s.index.Lookup(key); found {
 		return fmt.Errorf("Insert: key %x already exists; use Update", key)
 	}
 
-	// Find the predecessor in the ordered list (the largest active key < newKey).
 	predKey, predEntryID, err := s.findPredecessor(key)
 	if err != nil {
 		return fmt.Errorf("Insert findPredecessor: %w", err)
 	}
-
-	// Read the predecessor entry to get its current NextKey.
 	predEntry, err := s.log.ReadEntry(predEntryID)
 	if err != nil {
 		return fmt.Errorf("Insert read predecessor: %w", err)
 	}
 
-	// ── Step 1: Append the new key's Entry ──────────────────────────────────
+	// If this key was previously deleted, chain the OldId to preserve full history.
+	// Also record the deletion event in lifecycleBreaks so GetAtVersion can correctly
+	// return nil for queries that fall inside the "deleted window".
+	oldID := types.NullEntryID
+	if rec, deleted := s.deletedKeys[key]; deleted {
+		oldID = rec.lastEntryID
+		delete(s.deletedKeys, key)
+		s.lifecycleBreaks[key] = append(s.lifecycleBreaks[key], rec)
+	}
+
 	newEntry := &types.Entry{
-		Id:           s.nextEntryID,
 		Key:          key,
 		Value:        append([]byte{}, value...),
-		NextKey:      predEntry.NextKey, // new entry's successor = predecessor's old successor
-		OldId:        types.NullEntryID,
+		NextKey:      predEntry.NextKey,
+		OldId:        oldID,
 		OldNextKeyId: types.NullEntryID,
 		Version:      version,
-		IsDeleted:    false,
 	}
 	if _, err := s.appendEntry(newEntry); err != nil {
 		return err
 	}
 
-	// ── Step 2: Append a new version of the predecessor ─────────────────────
-	// The predecessor's NextKey changes from its old value to the new key.
 	updatedPred := &types.Entry{
-		Id:           s.nextEntryID,
 		Key:          predKey,
 		Value:        append([]byte{}, predEntry.Value...),
-		NextKey:      key, // now points to the new key
+		NextKey:      key,
 		OldId:        predEntryID,
 		OldNextKeyId: predEntry.OldNextKeyId,
 		Version:      version,
@@ -216,27 +261,25 @@ func (s *Shard) Insert(key [types.KeySize]byte, value []byte, version types.Vers
 		return err
 	}
 
-	// ── Update index ────────────────────────────────────────────────────────
-	// Mark predecessor's old entry inactive in its Twig.
 	s.markEntryInactive(predEntryID)
-	// Index: new key → new entry; predecessor → updated predecessor.
 	s.index.Upsert(key, newEntry.Id)
 	s.index.Upsert(predKey, updatedPred.Id)
-
 	return nil
 }
 
 // Update modifies the value of an existing key.
-// Appends exactly 1 new Entry; NextKey is preserved.
 func (s *Shard) Update(key [types.KeySize]byte, value []byte, version types.Version) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.updateLocked(key, value, version)
+}
 
+// updateLocked is the implementation of Update; caller must hold s.mu write lock.
+func (s *Shard) updateLocked(key [types.KeySize]byte, value []byte, version types.Version) error {
 	currentID, found := s.index.Lookup(key)
 	if !found {
 		return fmt.Errorf("Update: key %x not found; use Insert", key)
 	}
-
 	currentEntry, err := s.log.ReadEntry(currentID)
 	if err != nil {
 		return err
@@ -246,22 +289,30 @@ func (s *Shard) Update(key [types.KeySize]byte, value []byte, version types.Vers
 	}
 
 	newEntry := &types.Entry{
-		Id:           s.nextEntryID,
 		Key:          key,
 		Value:        append([]byte{}, value...),
 		NextKey:      currentEntry.NextKey,
 		OldId:        currentID,
 		OldNextKeyId: currentEntry.OldNextKeyId,
 		Version:      version,
-		IsDeleted:    false,
 	}
 	if _, err := s.appendEntry(newEntry); err != nil {
 		return err
 	}
-
 	s.markEntryInactive(currentID)
 	s.index.Upsert(key, newEntry.Id)
 	return nil
+}
+
+// Upsert atomically inserts or updates a key-value pair under a single write lock,
+// eliminating the TOCTOU race that would occur with a separate Get + Insert/Update.
+func (s *Shard) Upsert(key [types.KeySize]byte, value []byte, version types.Version) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, found := s.index.Lookup(key); found {
+		return s.updateLocked(key, value, version)
+	}
+	return s.insertLocked(key, value, version)
 }
 
 // Delete removes a key from the active state.
@@ -309,6 +360,9 @@ func (s *Shard) Delete(key [types.KeySize]byte, version types.Version) error {
 	if _, err := s.appendEntry(updatedPred); err != nil {
 		return err
 	}
+
+	// Record deletion history before removing from the live index.
+	s.deletedKeys[key] = deletedKeyRecord{lastEntryID: currentID, deletionVersion: version}
 
 	// Mark both old entries inactive.
 	s.markEntryInactive(currentID)
@@ -494,7 +548,14 @@ func (s *Shard) appendEntry(e *types.Entry) (int64, error) {
 // sealFreshTwig transitions the current Fresh Twig to Full and creates a new Fresh Twig.
 func (s *Shard) sealFreshTwig() {
 	old := s.freshTwig
-	old.TransitionToFull()
+	old.TransitionToFull() // sets all ActiveBits to 1
+
+	// Apply deferred inactivations: entries that were superseded while still in this twig.
+	for _, slot := range s.freshInactiveSlots {
+		old.MarkSlotInactive(slot)
+	}
+	s.freshInactiveSlots = s.freshInactiveSlots[:0]
+
 	s.twigs[old.TwigID] = old
 
 	// Open a new Fresh Twig.
@@ -508,17 +569,14 @@ func (s *Shard) sealFreshTwig() {
 }
 
 // markEntryInactive clears the ActiveBit for the given entry in its Twig.
-// For entries in the Fresh Twig (which hasn't been sealed yet), inactivation
-// is deferred to the Full state — the Fresh Twig always has all written slots considered active.
-// For entries in Full Twigs, we set ActiveBits immediately.
+// For entries still in the Fresh Twig, the slot is deferred to freshInactiveSlots.
+// For Full Twigs, we clear the bit immediately; if the twig becomes Inactive, prune it.
 func (s *Shard) markEntryInactive(entryID uint64) {
-	twigID := entryID / types.TwigSize
-	slot := int(entryID % types.TwigSize)
+	twigID := entryID / uint64(types.TwigSize)
+	slot := int(entryID % uint64(types.TwigSize))
 
 	if twigID == s.freshTwig.TwigID {
-		// Entry is in the Fresh Twig; ActiveBits are managed on transition to Full.
-		// We record a "to-deactivate" list, but for simplicity in this implementation,
-		// we handle it in the Full Twig after sealing.
+		s.freshInactiveSlots = append(s.freshInactiveSlots, slot)
 		return
 	}
 
@@ -526,7 +584,13 @@ func (s *Shard) markEntryInactive(entryID uint64) {
 	if !ok {
 		return
 	}
-	t.MarkSlotInactive(slot)
+	if became := t.MarkSlotInactive(slot); became {
+		// Twig just became Inactive — prune it from memory; UpperTree keeps its root hash.
+		rootHash := t.RootHash
+		t.TransitionToPruned()
+		delete(s.twigs, twigID)
+		s.prunedTwigRoots[twigID] = rootHash
+	}
 }
 
 // findPredecessor locates the largest active key strictly less than `key`
@@ -562,4 +626,298 @@ func (s *Shard) getEntryLocked(key [types.KeySize]byte) (*types.Entry, error) {
 		return nil, nil
 	}
 	return s.log.ReadEntry(entryID)
+}
+
+// GetTwig returns the Full or Inactive Twig with the given ID.
+// The current Fresh Twig is not returned by this method; use FreshTwigSnapshot for that.
+func (s *Shard) GetTwig(twigID uint64) (*twig.Twig, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.twigs[twigID]
+	return t, ok
+}
+
+// BuildProofForFullTwig reads all entries for twigID from the append log, rebuilds the
+// twig's internal Merkle tree in memory, and returns the 11-sibling proof for `slot`.
+// Used for generating proofs on Full/Inactive Twigs (where FreshData has been released).
+func (s *Shard) BuildProofForFullTwig(twigID uint64, slot int) ([]crypto.Hash, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	leaves, err := s.rebuildTwigLeavesLocked(twigID)
+	if err != nil {
+		return nil, err
+	}
+
+	fd := twig.RebuildFromLeaves(leaves)
+	// Construct a temporary Fresh-state Twig backed by the rebuilt FreshData.
+	tempTwig := &twig.Twig{
+		TwigID:   twigID,
+		ShardID:  s.shardID,
+		Status:   twig.StatusFresh,
+		RootHash: fd.Nodes[1],
+		Fresh:    fd,
+	}
+	return tempTwig.MerkleProof(slot), nil
+}
+
+// rebuildTwigLeavesLocked reads all 2048 entry hashes for the given twigID from the log.
+// Caller must hold at least s.mu.RLock.
+func (s *Shard) rebuildTwigLeavesLocked(twigID uint64) ([types.TwigSize]crypto.Hash, error) {
+	var leaves [types.TwigSize]crypto.Hash
+	for i := range leaves {
+		leaves[i] = crypto.NullHash
+	}
+	startID := twigID * uint64(types.TwigSize)
+	for slot := 0; slot < types.TwigSize; slot++ {
+		e, err := s.log.ReadEntry(startID + uint64(slot))
+		if err != nil {
+			continue // entry absent in this shard's log (e.g. first few IDs belong to sentinels)
+		}
+		leaves[slot] = crypto.HashEntry(
+			e.Id, e.Key[:], e.Value, e.NextKey[:],
+			e.OldId, e.OldNextKeyId, uint64(e.Version), e.IsDeleted,
+		)
+	}
+	return leaves, nil
+}
+
+// FindPredecessorEntry returns the entry for the largest active key strictly less than key.
+// Used to build non-existence proofs (predecessor.Key < query ≤ predecessor.NextKey).
+func (s *Shard) FindPredecessorEntry(key [types.KeySize]byte) (*types.Entry, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	_, predID, err := s.findPredecessor(key)
+	if err != nil {
+		return nil, err
+	}
+	return s.log.ReadEntry(predID)
+}
+
+// Close flushes and closes the underlying CSV append log.
+func (s *Shard) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.log.Close()
+}
+
+// EmitTwigRoots calls onRootChange for every known twig (Full, Inactive/Pruned, and Fresh).
+// Used after rebuildFromLog() to synchronise the UpperTree with the recovered shard state.
+func (s *Shard) EmitTwigRoots() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.onRootChange == nil {
+		return
+	}
+	for twigID, rootHash := range s.prunedTwigRoots {
+		s.onRootChange(s.shardID, twigID, rootHash)
+	}
+	for _, t := range s.twigs {
+		s.onRootChange(s.shardID, t.TwigID, t.RootHash)
+	}
+	s.onRootChange(s.shardID, s.freshTwig.TwigID, s.freshTwig.RootHash)
+}
+
+// ──────────────────────────── recovery ─────────────────────────────────────────
+
+// rebuildFromLog scans the CSV append log and reconstructs all in-memory state:
+//   - B-tree index (key → current entry ID)
+//   - deletedKeys map
+//   - Full twigs with correct ActiveBits
+//   - Current Fresh Twig with leaf hashes
+//
+// After NewShard returns, the caller should call EmitTwigRoots() to populate
+// the UpperTree (db.Open does this for all shards after the wait group).
+func (s *Shard) rebuildFromLog() error {
+	entries, err := s.log.ReadAllEntries()
+	if err != nil {
+		return fmt.Errorf("scan log: %w", err)
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	// Build fast-lookup map and find maxID.
+	entryMap := make(map[uint64]*types.Entry, len(entries))
+	var maxID uint64
+	for _, e := range entries {
+		entryMap[e.Id] = e
+		if e.Id > maxID {
+			maxID = e.Id
+		}
+	}
+	s.nextEntryID = maxID + 1
+	s.totalEntryCount = int64(len(entries))
+
+	// Build superseded set: every entry ID that has a newer version.
+	superseded := make(map[uint64]bool, len(entries))
+	for _, e := range entries {
+		if e.OldId != types.NullEntryID {
+			superseded[e.OldId] = true
+		}
+	}
+
+	// Build deletedByOldNextKey set: entry IDs that are pointed to by OldNextKeyId.
+	// These correspond to entries whose keys were deleted (the predecessor was updated
+	// to skip over them). Unlike superseded entries, these are NOT replaced by a newer
+	// version of the same key — the key simply was removed from the live index.
+	deletedByOldNextKey := make(map[uint64]bool, len(entries)/4)
+	for _, e := range entries {
+		if e.OldNextKeyId != types.NullEntryID {
+			deletedByOldNextKey[e.OldNextKeyId] = true
+		}
+	}
+
+	// Determine the current fresh twig.
+	// If the last-written entry was the final slot (slot == TwigSize-1), the inline
+	// sealFreshTwig() call created an empty new fresh twig (nextTwigID = that+1).
+	lastSlot := maxID % uint64(types.TwigSize)
+	lastTwigIDx := maxID / uint64(types.TwigSize)
+	var freshTwigID uint64
+	if lastSlot == uint64(types.TwigSize)-1 {
+		freshTwigID = lastTwigIDx + 1
+	} else {
+		freshTwigID = lastTwigIDx
+	}
+	s.nextTwigID = freshTwigID + 1
+
+	// Populate live index.
+	// An entry is "live" (current) if:
+	//   (a) it is NOT superseded by a newer version (OldId chain), AND
+	//   (b) it is NOT a deleted entry (not pointed to by any OldNextKeyId field).
+	// Condition (b) handles pure-deletion without re-insertion: the deleted entry's
+	// ID appears as OldNextKeyId in the updated predecessor, marking it as "gone".
+	liveKeys := make(map[[types.KeySize]byte]uint64, len(entries)/2)
+	for _, e := range entries {
+		if !superseded[e.Id] && !deletedByOldNextKey[e.Id] {
+			liveKeys[e.Key] = e.Id
+		}
+	}
+	for key, id := range liveKeys {
+		s.index.Upsert(key, id)
+	}
+
+	// Populate freshInactiveSlots: fresh-twig entries already superseded.
+	for _, e := range entries {
+		if e.TwigID() == freshTwigID && superseded[e.Id] {
+			s.freshInactiveSlots = append(s.freshInactiveSlots, int(e.SlotIndex()))
+		}
+	}
+
+	// Rebuild deletedKeys and lifecycleBreaks.
+	//
+	// A deletion event is: entry E where OldNextKeyId != Null, pointing to entry D.
+	// The minimum version among all entries pointing to D gives the deletion version.
+	//
+	// If D's key is NOT currently alive → add to deletedKeys.
+	// If D's key IS currently alive   → the key was re-inserted; add to lifecycleBreaks.
+	deletionVersionFor := make(map[uint64]types.Version)
+	for _, e := range entries {
+		if e.OldNextKeyId == types.NullEntryID {
+			continue
+		}
+		pointed, ok := entryMap[e.OldNextKeyId]
+		if !ok {
+			continue
+		}
+		if pointed.Key == types.MinKey || pointed.Key == types.MaxKey {
+			continue
+		}
+		if prev, seen := deletionVersionFor[e.OldNextKeyId]; !seen || e.Version < prev {
+			deletionVersionFor[e.OldNextKeyId] = e.Version
+		}
+	}
+	for deletedEntryID, deletionVer := range deletionVersionFor {
+		del := entryMap[deletedEntryID]
+		if del == nil {
+			continue
+		}
+		rec := deletedKeyRecord{
+			lastEntryID:     deletedEntryID,
+			deletionVersion: deletionVer,
+		}
+		if _, alive := liveKeys[del.Key]; alive {
+			// Key was re-inserted after deletion → store in lifecycleBreaks.
+			s.lifecycleBreaks[del.Key] = append(s.lifecycleBreaks[del.Key], rec)
+		} else {
+			// Key is currently deleted → store in deletedKeys.
+			s.deletedKeys[del.Key] = rec
+		}
+	}
+
+	// Rebuild Full twigs (IDs 0 .. freshTwigID-1).
+	for twigID := uint64(0); twigID < freshTwigID; twigID++ {
+		leaves := rebuildTwigLeavesFromMap(twigID, entryMap)
+		fd := twig.RebuildFromLeaves(leaves)
+
+		t := &twig.Twig{
+			TwigID:  twigID,
+			ShardID: s.shardID,
+			Status:  twig.StatusFull,
+		}
+		for i := range t.ActiveBits {
+			t.ActiveBits[i] = 0xFF
+		}
+		t.ActiveCount = types.TwigSize
+		t.RootHash = fd.Nodes[1]
+
+		startID := twigID * uint64(types.TwigSize)
+		for slot := 0; slot < types.TwigSize; slot++ {
+			if superseded[startID+uint64(slot)] {
+				t.MarkSlotInactive(slot)
+			}
+		}
+
+		if t.Status == twig.StatusInactive {
+			// All entries superseded — prune immediately.
+			rootHash := t.RootHash
+			t.TransitionToPruned()
+			s.prunedTwigRoots[twigID] = rootHash
+		} else {
+			s.twigs[twigID] = t
+		}
+	}
+
+	// Rebuild the current Fresh Twig.
+	s.freshTwig = twig.NewFreshTwig(freshTwigID, s.shardID)
+	startID := freshTwigID * uint64(types.TwigSize)
+	for slot := 0; slot < types.TwigSize; slot++ {
+		entryID := startID + uint64(slot)
+		if entryID >= s.nextEntryID {
+			break
+		}
+		e, ok := entryMap[entryID]
+		if !ok {
+			break
+		}
+		leafHash := crypto.HashEntry(
+			e.Id, e.Key[:], e.Value, e.NextKey[:],
+			e.OldId, e.OldNextKeyId, uint64(e.Version), e.IsDeleted,
+		)
+		s.freshTwig.AppendLeaf(leafHash)
+	}
+
+	return nil
+}
+
+// rebuildTwigLeavesFromMap builds the leaf-hash array for a twig purely from the
+// in-memory entry map (no disk reads). Absent slots get crypto.NullHash.
+func rebuildTwigLeavesFromMap(twigID uint64, entryMap map[uint64]*types.Entry) [types.TwigSize]crypto.Hash {
+	var leaves [types.TwigSize]crypto.Hash
+	for i := range leaves {
+		leaves[i] = crypto.NullHash
+	}
+	startID := twigID * uint64(types.TwigSize)
+	for slot := 0; slot < types.TwigSize; slot++ {
+		e, ok := entryMap[startID+uint64(slot)]
+		if !ok {
+			continue
+		}
+		leaves[slot] = crypto.HashEntry(
+			e.Id, e.Key[:], e.Value, e.NextKey[:],
+			e.OldId, e.OldNextKeyId, uint64(e.Version), e.IsDeleted,
+		)
+	}
+	return leaves
 }

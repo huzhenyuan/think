@@ -52,7 +52,7 @@ type BTreeIndex struct {
 // degree = 32 gives good cache performance for billions of entries.
 func NewBTreeIndex() *BTreeIndex {
 	return &BTreeIndex{
-		tree: btree.NewG[IndexEntry](32, less),
+		tree: btree.NewG(32, less),
 	}
 }
 
