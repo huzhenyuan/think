@@ -48,20 +48,20 @@ func NewObserver(dataDir string) *Observer {
 	o.traceFile = f
 	o.traceCSV = csv.NewWriter(f)
 	_ = o.traceCSV.Write([]string{
-		"seq",        // global sub-step index
-		"op_seq",     // which high-level operation (AfterWrite call index)
-		"op",         // high-level op: Set / Delete / Init
-		"sub_op",     // fine-grained action (see constants below)
-		"shard_id",   // affected shard
-		"key_hex",    // 56-char hex of 28-byte key
-		"entry_id",   // entry ID involved, or ""
-		"old_id",     // prev entry ID (for supersede events)
-		"twig_id",    // twig affected
-		"slot",       // slot within the twig
-		"block",      // block height
-		"tx",         // tx index
-		"hash_hex",   // new Merkle hash (Twig root / UpperTree root / leaf hash)
-		"detail",     // human-readable description (English)
+		"seq",      // global sub-step index
+		"op_seq",   // which high-level operation (AfterWrite call index)
+		"op",       // high-level op: Set / Delete / Init
+		"sub_op",   // fine-grained action (see constants below)
+		"shard_id", // affected shard
+		"key_hex",  // 56-char hex of 28-byte key
+		"entry_id", // entry ID involved, or ""
+		"old_id",   // prev entry ID (for supersede events)
+		"twig_id",  // twig affected
+		"slot",     // slot within the twig
+		"block",    // block height
+		"tx",       // tx index
+		"hash_hex", // new Merkle hash (Twig root / UpperTree root / leaf hash)
+		"detail",   // human-readable description (English)
 	})
 	o.traceCSV.Flush()
 	return o
