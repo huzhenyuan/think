@@ -24,6 +24,12 @@ import (
 // The db layer uses this to update the upper Merkle tree.
 type RootChangeCallback func(shardID int, twigID uint64, newTwigRoot crypto.Hash)
 
+// TraceHook is an optional fine-grained observability callback.
+// Each sub-step inside an Insert/Update/Delete operation calls this with a short
+// machine-readable subOp string and a human-readable detail string.
+// All string arguments are pre-formatted by the caller (hex-encoded, etc.).
+type TraceHook func(op, subOp, keyHex, entryID, oldID, twigID, slot, block, tx, hashHex, detail string)
+
 // deletedKeyRecord holds the last-known entry ID and deletion version for a deleted key.
 // Used by GetAtVersion to walk history for keys that have been removed.
 type deletedKeyRecord struct {
@@ -78,6 +84,16 @@ type Shard struct {
 	// Needed to answer GetAtVersion queries that fall within a "deleted window" of a
 	// multi-lifecycle key (insert → delete → re-insert).
 	lifecycleBreaks map[[types.KeySize]byte][]deletedKeyRecord
+
+	// traceHook is an optional fine-grained trace callback (nil = disabled).
+	traceHook TraceHook
+
+	// currentOp is the high-level operation name for the current write ("Set"/"Delete").
+	currentOp string
+
+	// currentBlock / currentTx are forwarded from db for trace annotations.
+	currentBlock uint64
+	currentTx    uint32
 }
 
 // NewShard creates a new empty Shard.
@@ -117,6 +133,36 @@ func NewShard(shardID int, dataDir string, onRootChange RootChangeCallback) (*Sh
 	}
 
 	return s, nil
+}
+
+// SetTraceHook attaches a fine-grained trace callback to this Shard.
+// Pass nil to disable tracing.
+func (s *Shard) SetTraceHook(h TraceHook) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.traceHook = h
+}
+
+// SetCurrentOp is called by the db layer just before a write to annotate traces.
+func (s *Shard) SetCurrentOp(op string, block uint64, tx uint32) {
+	s.currentOp = op
+	s.currentBlock = block
+	s.currentTx = tx
+}
+
+// trace emits one sub-step row if a TraceHook is installed.
+// MUST be called with s.mu held (read or write).
+func (s *Shard) trace(subOp, keyHex, entryID, oldID, twigID, slot, hashHex, detail string) {
+	if s.traceHook == nil {
+		return
+	}
+	s.traceHook(
+		s.currentOp, subOp,
+		keyHex, entryID, oldID, twigID, slot,
+		fmt.Sprintf("%d", s.currentBlock),
+		fmt.Sprintf("%d", s.currentTx),
+		hashHex, detail,
+	)
 }
 
 // ──────────────────────────── Public read operations ─────────────────────────
@@ -213,22 +259,28 @@ func (s *Shard) Insert(key [types.KeySize]byte, value []byte, version types.Vers
 
 // insertLocked is the implementation of Insert; caller must hold s.mu write lock.
 func (s *Shard) insertLocked(key [types.KeySize]byte, value []byte, version types.Version) error {
-	if _, found := s.index.Lookup(key); found {
+	keyHex := fmt.Sprintf("%x", key)
+
+	// ① B-Tree lookup: check key does not exist
+	_, found := s.index.Lookup(key)
+	s.trace("btree_lookup", keyHex, "", "", "", "", "", fmt.Sprintf("key %s → found=%v (Insert: must be absent)", keyHex[:16]+"…", found))
+	if found {
 		return fmt.Errorf("Insert: key %x already exists; use Update", key)
 	}
 
+	// ② Find predecessor in sorted linked list
 	predKey, predEntryID, err := s.findPredecessor(key)
 	if err != nil {
 		return fmt.Errorf("Insert findPredecessor: %w", err)
 	}
+	s.trace("find_predecessor", keyHex, fmt.Sprintf("%d", predEntryID), "", "", "", "", fmt.Sprintf("predecessor key=%x… entry_id=%d", predKey[:4], predEntryID))
+
 	predEntry, err := s.log.ReadEntry(predEntryID)
 	if err != nil {
 		return fmt.Errorf("Insert read predecessor: %w", err)
 	}
 
 	// If this key was previously deleted, chain the OldId to preserve full history.
-	// Also record the deletion event in lifecycleBreaks so GetAtVersion can correctly
-	// return nil for queries that fall inside the "deleted window".
 	oldID := types.NullEntryID
 	if rec, deleted := s.deletedKeys[key]; deleted {
 		oldID = rec.lastEntryID
@@ -244,6 +296,7 @@ func (s *Shard) insertLocked(key [types.KeySize]byte, value []byte, version type
 		OldNextKeyId: types.NullEntryID,
 		Version:      version,
 	}
+	// ③ Append new Entry (the actual key's data)
 	if _, err := s.appendEntry(newEntry); err != nil {
 		return err
 	}
@@ -257,13 +310,20 @@ func (s *Shard) insertLocked(key [types.KeySize]byte, value []byte, version type
 		Version:      version,
 		IsDeleted:    predEntry.IsDeleted,
 	}
+	// ④ Append updated predecessor (NextKey now points to new entry)
 	if _, err := s.appendEntry(updatedPred); err != nil {
 		return err
 	}
 
+	// ⑤ Mark old predecessor inactive
 	s.markEntryInactive(predEntryID)
+	s.trace("mark_inactive", fmt.Sprintf("%x", predKey), fmt.Sprintf("%d", predEntryID), "", fmt.Sprintf("%d", predEntryID/uint64(types.TwigSize)), fmt.Sprintf("%d", predEntryID%uint64(types.TwigSize)), "", fmt.Sprintf("predecessor entry #%d superseded by #%d", predEntryID, updatedPred.Id))
+
+	// ⑥ Update B-Tree index
 	s.index.Upsert(key, newEntry.Id)
+	s.trace("btree_update", keyHex, fmt.Sprintf("%d", newEntry.Id), "", "", "", "", fmt.Sprintf("index[key=%s…] ← entry_id=%d (new entry)", keyHex[:16]+"…", newEntry.Id))
 	s.index.Upsert(predKey, updatedPred.Id)
+	s.trace("btree_update", fmt.Sprintf("%x", predKey), fmt.Sprintf("%d", updatedPred.Id), fmt.Sprintf("%d", predEntryID), "", "", "", fmt.Sprintf("index[predKey=%x…] ← entry_id=%d (updated predecessor)", predKey[:4], updatedPred.Id))
 	return nil
 }
 
@@ -276,7 +336,11 @@ func (s *Shard) Update(key [types.KeySize]byte, value []byte, version types.Vers
 
 // updateLocked is the implementation of Update; caller must hold s.mu write lock.
 func (s *Shard) updateLocked(key [types.KeySize]byte, value []byte, version types.Version) error {
+	keyHex := fmt.Sprintf("%x", key)
+
+	// ① B-Tree lookup: find current entry
 	currentID, found := s.index.Lookup(key)
+	s.trace("btree_lookup", keyHex, fmt.Sprintf("%d", currentID), "", "", "", "", fmt.Sprintf("key %s… → entry_id=%d (Update: must exist)", keyHex[:16]+"…", currentID))
 	if !found {
 		return fmt.Errorf("Update: key %x not found; use Insert", key)
 	}
@@ -296,11 +360,16 @@ func (s *Shard) updateLocked(key [types.KeySize]byte, value []byte, version type
 		OldNextKeyId: currentEntry.OldNextKeyId,
 		Version:      version,
 	}
+	// ② Append new version of Entry (OldId → previous version)
 	if _, err := s.appendEntry(newEntry); err != nil {
 		return err
 	}
+	// ③ Mark old version inactive
 	s.markEntryInactive(currentID)
+	s.trace("mark_inactive", keyHex, fmt.Sprintf("%d", currentID), "", fmt.Sprintf("%d", currentID/uint64(types.TwigSize)), fmt.Sprintf("%d", currentID%uint64(types.TwigSize)), "", fmt.Sprintf("entry #%d superseded by new entry #%d", currentID, newEntry.Id))
+	// ④ Update B-Tree index
 	s.index.Upsert(key, newEntry.Id)
+	s.trace("btree_update", keyHex, fmt.Sprintf("%d", newEntry.Id), fmt.Sprintf("%d", currentID), "", "", "", fmt.Sprintf("index[key=%s…] ← entry_id=%d (was %d)", keyHex[:16]+"…", newEntry.Id, currentID))
 	return nil
 }
 
@@ -322,7 +391,11 @@ func (s *Shard) Delete(key [types.KeySize]byte, version types.Version) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	keyHex := fmt.Sprintf("%x", key)
+
+	// ① B-Tree lookup: find current entry to delete
 	currentID, found := s.index.Lookup(key)
+	s.trace("btree_lookup", keyHex, fmt.Sprintf("%d", currentID), "", "", "", "", fmt.Sprintf("key %s… → entry_id=%d (Delete: found=%v)", keyHex[:16]+"…", currentID, found))
 	if !found {
 		return fmt.Errorf("Delete: key %x not found", key)
 	}
@@ -335,18 +408,19 @@ func (s *Shard) Delete(key [types.KeySize]byte, version types.Version) error {
 		return fmt.Errorf("Delete: key %x already deleted", key)
 	}
 
-	// Find the predecessor.
+	// ② Find predecessor (to re-stitch the linked list)
 	predKey, predEntryID, err := s.findPredecessor(key)
 	if err != nil {
 		return fmt.Errorf("Delete findPredecessor: %w", err)
 	}
+	s.trace("find_predecessor", keyHex, fmt.Sprintf("%d", predEntryID), "", "", "", "", fmt.Sprintf("predecessor key=%x… entry_id=%d; will re-stitch NextKey to skip deleted entry", predKey[:4], predEntryID))
 
 	predEntry, err := s.log.ReadEntry(predEntryID)
 	if err != nil {
 		return err
 	}
 
-	// Append updated predecessor: skip over the deleted key.
+	// ③ Append updated predecessor: skip over the deleted key.
 	updatedPred := &types.Entry{
 		Id:           s.nextEntryID,
 		Key:          predKey,
@@ -364,13 +438,17 @@ func (s *Shard) Delete(key [types.KeySize]byte, version types.Version) error {
 	// Record deletion history before removing from the live index.
 	s.deletedKeys[key] = deletedKeyRecord{lastEntryID: currentID, deletionVersion: version}
 
-	// Mark both old entries inactive.
+	// ④ Mark both old entries inactive
 	s.markEntryInactive(currentID)
+	s.trace("mark_inactive", keyHex, fmt.Sprintf("%d", currentID), "", fmt.Sprintf("%d", currentID/uint64(types.TwigSize)), fmt.Sprintf("%d", currentID%uint64(types.TwigSize)), "", fmt.Sprintf("deleted entry #%d marked inactive (tombstone recorded)", currentID))
 	s.markEntryInactive(predEntryID)
+	s.trace("mark_inactive", fmt.Sprintf("%x", predKey), fmt.Sprintf("%d", predEntryID), "", fmt.Sprintf("%d", predEntryID/uint64(types.TwigSize)), fmt.Sprintf("%d", predEntryID%uint64(types.TwigSize)), "", fmt.Sprintf("old predecessor entry #%d superseded by #%d", predEntryID, updatedPred.Id))
 
-	// Remove the deleted key from the index; update predecessor.
+	// ⑤ Remove deleted key from B-Tree; update predecessor
 	s.index.Delete(key)
+	s.trace("btree_update", keyHex, "", "", "", "", "", fmt.Sprintf("index.Delete(key=%s…) — key removed from live index", keyHex[:16]+"…"))
 	s.index.Upsert(predKey, updatedPred.Id)
+	s.trace("btree_update", fmt.Sprintf("%x", predKey), fmt.Sprintf("%d", updatedPred.Id), fmt.Sprintf("%d", predEntryID), "", "", "", fmt.Sprintf("index[predKey=%x…] ← entry_id=%d (NextKey now skips deleted)", predKey[:4], updatedPred.Id))
 	return nil
 }
 
@@ -519,22 +597,52 @@ func (s *Shard) appendEntry(e *types.Entry) (int64, error) {
 	s.nextEntryID++
 	s.totalEntryCount++
 
+	// Sub-step A: write to append log (simulates SSD sequential write)
+	keyHex := fmt.Sprintf("%x", e.Key)
+	entryIDStr := fmt.Sprintf("%d", e.Id)
+	twigIDStr := fmt.Sprintf("%d", e.Id/uint64(types.TwigSize))
+	slotStr := fmt.Sprintf("%d", e.Id%uint64(types.TwigSize))
+	oldIDStr := ""
+	if e.OldId != types.NullEntryID {
+		oldIDStr = fmt.Sprintf("%d", e.OldId)
+	}
+	deletedLabel := ""
+	if e.IsDeleted {
+		deletedLabel = " [tombstone]"
+	}
+	s.trace("log_append", keyHex, entryIDStr, oldIDStr, twigIDStr, slotStr, "",
+		fmt.Sprintf("append entry #%d to log: key=%s…%s twig=%s slot=%s", e.Id, keyHex[:16]+"…", deletedLabel, twigIDStr, slotStr))
+
 	offset, err := s.log.Append(e)
 	if err != nil {
 		return 0, err
 	}
 
-	// Hash the entry and append it as a leaf in the Fresh Twig.
+	// Sub-step B: compute leaf hash (Keccak256 of full entry fields)
 	leafHash := crypto.HashEntry(
 		e.Id, e.Key[:], e.Value, e.NextKey[:],
 		e.OldId, e.OldNextKeyId,
 		uint64(e.Version), e.IsDeleted,
 	)
-	newRoot := s.freshTwig.AppendLeaf(leafHash)
+	s.trace("leaf_hash", keyHex, entryIDStr, oldIDStr, twigIDStr, slotStr,
+		fmt.Sprintf("%x", leafHash),
+		fmt.Sprintf("Hash(entry#%d) → leaf_hash=%x… (Keccak256 of key|value|nextKey|oldId|…)", e.Id, leafHash[:8]))
 
-	// Notify upper tree of the new root.
+	// Sub-step C: insert leaf into Fresh Twig → recompute Merkle path
+	prevRoot := s.freshTwig.RootHash
+	newRoot := s.freshTwig.AppendLeaf(leafHash)
+	if newRoot != prevRoot {
+		s.trace("twig_rehash", keyHex, entryIDStr, "", twigIDStr, slotStr,
+			fmt.Sprintf("%x", newRoot),
+			fmt.Sprintf("Twig#%s Merkle path rehashed: slot%s filled → new twig_root=%x…", twigIDStr, slotStr, newRoot[:8]))
+	}
+
+	// Sub-step D: notify UpperTree of new Twig root → propagate to global root
 	if s.onRootChange != nil {
 		s.onRootChange(s.shardID, s.freshTwig.TwigID, newRoot)
+		s.trace("twig_root_update", keyHex, entryIDStr, "", twigIDStr, "",
+			fmt.Sprintf("%x", newRoot),
+			fmt.Sprintf("UpperTree.UpdateTwigRoot(shard=%d, twig=%s, root=%x…) → global state root changes", s.shardID, twigIDStr, newRoot[:8]))
 	}
 
 	// If the Fresh Twig just became full, transition it to Full and open a new one.

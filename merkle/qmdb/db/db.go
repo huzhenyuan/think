@@ -100,6 +100,14 @@ func (db *QMDB) Close() error {
 	return nil
 }
 
+// SetShardTraceHooks installs a TraceHook on every Shard.
+// Call this after attaching an Observer (which provides the hook implementation).
+func (db *QMDB) SetShardTraceHooks(hook shard.TraceHook) {
+	for i := 0; i < types.ShardCount; i++ {
+		db.shards[i].SetTraceHook(hook)
+	}
+}
+
 // ──────────────────────────── Block lifecycle ─────────────────────────────────
 
 // BeginBlock starts processing a new block.
@@ -181,7 +189,9 @@ func (db *QMDB) Set(appKey []byte, value []byte) error {
 // and the write, eliminating the TOCTOU race of a separate Get + Insert/Update.
 func (db *QMDB) SetByStorageKey(key [types.KeySize]byte, value []byte) error {
 	version := db.currentVersion()
-	if err := db.shardFor(key).Upsert(key, value, version); err != nil {
+	s := db.shardFor(key)
+	s.SetCurrentOp("Set", version.BlockHeight(), version.TxIndex())
+	if err := s.Upsert(key, value, version); err != nil {
 		return err
 	}
 	db.notifyObserver("Set", key, version)
@@ -198,6 +208,7 @@ func (db *QMDB) Delete(appKey []byte) error {
 func (db *QMDB) DeleteByStorageKey(key [types.KeySize]byte) error {
 	version := db.currentVersion()
 	s := db.shardFor(key)
+	s.SetCurrentOp("Delete", version.BlockHeight(), version.TxIndex())
 	if err := s.Delete(key, version); err != nil {
 		return err
 	}

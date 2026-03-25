@@ -58,6 +58,8 @@ func main() {
 	// Attach the observer: every write will auto-dump CSV files.
 	obs := observe.NewObserver(dataDir)
 	qmdb.Observer = obs
+	// Attach fine-grained trace hooks to all 16 shards.
+	qmdb.SetShardTraceHooks(obs.MakeTraceHook())
 
 	// Dump the initial state (sentinels only).
 	obs.DumpAll(qmdb)

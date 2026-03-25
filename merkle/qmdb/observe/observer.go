@@ -23,17 +23,48 @@ import (
 
 	"github.com/qmdb/crypto"
 	"github.com/qmdb/db"
+	"github.com/qmdb/shard"
 	"github.com/qmdb/types"
 )
 
 // Observer implements db.ObserverHook and dumps CSV files after every write.
 type Observer struct {
-	dataDir string
+	dataDir   string
+	traceFile *os.File
+	traceCSV  *csv.Writer
+	traceSeq  int // monotonically increasing sub-step counter
+	opSeq     int // index of the current high-level operation (AfterWrite call)
 }
 
 // NewObserver creates an Observer that writes CSV files to dataDir.
 func NewObserver(dataDir string) *Observer {
-	return &Observer{dataDir: dataDir}
+	o := &Observer{dataDir: dataDir}
+
+	path := dataDir + "/trace.csv"
+	f, err := os.Create(path)
+	if err != nil {
+		return o
+	}
+	o.traceFile = f
+	o.traceCSV = csv.NewWriter(f)
+	_ = o.traceCSV.Write([]string{
+		"seq",        // global sub-step index
+		"op_seq",     // which high-level operation (AfterWrite call index)
+		"op",         // high-level op: Set / Delete / Init
+		"sub_op",     // fine-grained action (see constants below)
+		"shard_id",   // affected shard
+		"key_hex",    // 56-char hex of 28-byte key
+		"entry_id",   // entry ID involved, or ""
+		"old_id",     // prev entry ID (for supersede events)
+		"twig_id",    // twig affected
+		"slot",       // slot within the twig
+		"block",      // block height
+		"tx",         // tx index
+		"hash_hex",   // new Merkle hash (Twig root / UpperTree root / leaf hash)
+		"detail",     // human-readable description (English)
+	})
+	o.traceCSV.Flush()
+	return o
 }
 
 // AfterWrite is called by QMDB after every mutating operation.
@@ -54,6 +85,8 @@ func (o *Observer) AfterWrite(qmdb *db.QMDB, op string, key [types.KeySize]byte,
 
 	// 5. Append one row to the global state log.
 	o.appendGlobalState(qmdb, op, key, version)
+
+	o.opSeq++
 }
 
 // DumpAll writes all 6 CSV categories for all shards (useful at start-up / checkpoints).
@@ -266,4 +299,82 @@ func (o *Observer) appendGlobalState(qmdb *db.QMDB, op string, key [types.KeySiz
 		hex.EncodeToString(root[:]),
 	})
 	w.Flush()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Trace helpers — fine-grained sub-step logging
+// ─────────────────────────────────────────────────────────────────────────────
+
+// AppendTrace records one fine-grained sub-step to trace.csv.
+// Called by the Shard (via db layer) at every meaningful internal action.
+//
+// sub_op values used by callers:
+//   - "btree_lookup"       B-Tree key lookup (read)
+//   - "find_predecessor"   locate predecessor in sorted list (read)
+//   - "log_append"         append new Entry to CSV log (write)
+//   - "leaf_hash"          compute Keccak256 leaf hash for Entry
+//   - "twig_rehash"        recompute internal Merkle node(s) inside Fresh Twig
+//   - "twig_root_update"   Fresh Twig root changes → notify UpperTree
+//   - "upper_tree_update"  UpperTree propagates new Twig root toward global root
+//   - "btree_update"       B-Tree index entry inserted/updated/deleted
+//   - "mark_inactive"      entry superseded; ActiveBit cleared
+//   - "state_root"         final global state root after operation completes
+func (o *Observer) AppendTrace(
+	op string,
+	subOp string,
+	shardID int,
+	keyHex string,
+	entryID string,
+	oldID string,
+	twigID string,
+	slot string,
+	block string,
+	tx string,
+	hashHex string,
+	detail string,
+) {
+	if o.traceCSV == nil {
+		return
+	}
+	_ = o.traceCSV.Write([]string{
+		strconv.Itoa(o.traceSeq),
+		strconv.Itoa(o.opSeq),
+		op,
+		subOp,
+		strconv.Itoa(shardID),
+		keyHex,
+		entryID,
+		oldID,
+		twigID,
+		slot,
+		block,
+		tx,
+		hashHex,
+		detail,
+	})
+	o.traceCSV.Flush()
+	o.traceSeq++
+}
+
+// MakeTraceHook returns a shard.TraceHook that forwards every sub-step to this Observer's trace log.
+// Install it on all shards via qmdb.SetShardTraceHooks(obs.MakeTraceHook()).
+func (o *Observer) MakeTraceHook() shard.TraceHook {
+	return func(op, subOp, keyHex, entryID, oldID, twigID, slot, block, tx, hashHex, detail string) {
+		shardID := 0
+		if len(keyHex) >= 2 {
+			b, _ := strconv.ParseUint(keyHex[:2], 16, 8)
+			shardID = int(b >> 4)
+		}
+		o.AppendTrace(op, subOp, shardID, keyHex, entryID, oldID, twigID, slot, block, tx, hashHex, detail)
+	}
+}
+
+// Close flushes and closes the trace file.
+func (o *Observer) Close() {
+	if o.traceCSV != nil {
+		o.traceCSV.Flush()
+	}
+	if o.traceFile != nil {
+		_ = o.traceFile.Close()
+	}
 }
