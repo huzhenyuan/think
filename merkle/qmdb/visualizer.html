@@ -1,0 +1,1452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QMDB 运行动画演示</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface2: #21262d;
+    --border: #30363d;
+    --accent: #238636;
+    --accent2: #1f6feb;
+    --warn: #d29922;
+    --danger: #da3633;
+    --text: #e6edf3;
+    --text2: #8b949e;
+    --text3: #6e7681;
+    --set-color: #3fb950;
+    --del-color: #f85149;
+    --init-color: #58a6ff;
+    --green: #3fb950;
+    --blue: #58a6ff;
+    --orange: #d29922;
+    --purple: #bc8cff;
+    --pink: #ff7b72;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+    font-size: 13px;
+    overflow-x: hidden;
+  }
+
+  /* ── Header ── */
+  .header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .header h1 { font-size: 16px; color: var(--blue); font-weight: 700; }
+  .header-sub { color: var(--text2); font-size: 11px; }
+
+  /* ── Upload zone ── */
+  .upload-zone {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: calc(100vh - 58px);
+    padding: 40px;
+    gap: 24px;
+  }
+  .upload-box {
+    border: 2px dashed var(--border);
+    border-radius: 12px;
+    padding: 60px 80px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s;
+    background: var(--surface);
+    max-width: 600px;
+    width: 100%;
+  }
+  .upload-box:hover, .upload-box.drag-over {
+    border-color: var(--blue);
+    background: #1c2232;
+  }
+  .upload-box .icon { font-size: 48px; margin-bottom: 16px; }
+  .upload-box h2 { font-size: 18px; margin-bottom: 8px; color: var(--text); }
+  .upload-box p { color: var(--text2); font-size: 12px; line-height: 1.6; }
+  .upload-btn {
+    display: inline-block;
+    margin-top: 16px;
+    padding: 8px 24px;
+    background: var(--accent2);
+    color: white;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 13px;
+    border: none;
+    transition: background 0.2s;
+  }
+  .upload-btn:hover { background: #388bfd; }
+  #fileInput { display: none; }
+  .file-hints { color: var(--text3); font-size: 11px; text-align: center; }
+  .file-hints code { background: var(--surface2); padding: 2px 6px; border-radius: 4px; color: var(--orange); }
+
+  /* ── Main app layout ── */
+  .app { display: none; flex-direction: column; height: 100vh; overflow: hidden; }
+  .app.visible { display: flex; }
+
+  /* ── Controls bar ── */
+  .controls {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .btn {
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    transition: all 0.15s;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .btn:hover { border-color: var(--blue); color: var(--blue); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.primary { background: var(--accent2); border-color: var(--accent2); color: white; }
+  .btn.primary:hover { background: #388bfd; }
+  .btn.danger { background: #2d1215; border-color: var(--danger); color: var(--danger); }
+
+  .speed-label { color: var(--text2); font-size: 11px; }
+  .speed-select {
+    padding: 4px 8px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 4px;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  .step-counter {
+    margin-left: auto;
+    color: var(--text2);
+    font-size: 12px;
+  }
+  .step-counter strong { color: var(--text); }
+
+  /* ── Progress bar ── */
+  .progress-bar-wrap {
+    background: var(--surface2);
+    border-radius: 4px;
+    height: 6px;
+    width: 100%;
+    overflow: hidden;
+  }
+  .progress-bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--blue), var(--purple));
+    border-radius: 4px;
+    transition: width 0.3s ease;
+  }
+  .timeline-wrap {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 8px 20px;
+  }
+  .timeline {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .timeline-step {
+    flex-shrink: 0;
+    width: 36px;
+    height: 36px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    font-size: 10px;
+    color: var(--text3);
+    transition: all 0.15s;
+    position: relative;
+  }
+  .timeline-step:hover { border-color: var(--blue); color: var(--blue); }
+  .timeline-step.active { border-color: var(--blue); background: #1c2232; color: var(--blue); }
+  .timeline-step.visited { background: var(--surface2); color: var(--text2); }
+  .timeline-step.op-set { border-color: #1e4520; }
+  .timeline-step.op-set.visited { background: #0d2a10; color: var(--green); }
+  .timeline-step.op-set.active { background: #0d2a10; border-color: var(--green); color: var(--green); }
+  .timeline-step.op-delete { border-color: #3d1212; }
+  .timeline-step.op-delete.visited { background: #2d1215; color: var(--pink); }
+  .timeline-step.op-delete.active { background: #2d1215; border-color: var(--pink); color: var(--pink); }
+  .timeline-step .step-tooltip {
+    display: none;
+    position: absolute;
+    bottom: 42px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #2d333b;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    white-space: nowrap;
+    z-index: 200;
+    color: var(--text);
+    pointer-events: none;
+  }
+  .timeline-step:hover .step-tooltip { display: block; }
+
+  /* ── Main content ── */
+  .content {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+  }
+
+  /* ── Left panel: Step narrative ── */
+  .panel-narrative {
+    width: 300px;
+    flex-shrink: 0;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-title {
+    padding: 10px 14px;
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text2);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .narrative-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  .op-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 700;
+    margin-bottom: 12px;
+  }
+  .op-badge.Set { background: #0d2a10; color: var(--green); border: 1px solid #1e4520; }
+  .op-badge.Delete { background: #2d1215; color: var(--pink); border: 1px solid #3d1212; }
+  .op-badge.Init { background: #0c1a2e; color: var(--blue); border: 1px solid #1f3050; }
+
+  .narrative-section { margin-bottom: 16px; }
+  .narrative-section h3 { font-size: 11px; color: var(--text2); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .kv-row { display: flex; gap: 8px; margin-bottom: 5px; align-items: baseline; }
+  .kv-label { color: var(--text3); font-size: 11px; flex-shrink: 0; width: 80px; }
+  .kv-value { color: var(--text); font-size: 12px; word-break: break-all; }
+  .kv-value.mono { font-family: 'SF Mono', monospace; font-size: 11px; }
+  .kv-value.green { color: var(--green); }
+  .kv-value.blue { color: var(--blue); }
+  .kv-value.orange { color: var(--orange); }
+  .kv-value.pink { color: var(--pink); }
+  .kv-value.purple { color: var(--purple); }
+
+  .state-root-box {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin-bottom: 12px;
+  }
+  .state-root-box .label { font-size: 10px; color: var(--text3); margin-bottom: 4px; }
+  .state-root-box .hash {
+    font-size: 11px;
+    color: var(--purple);
+    font-family: monospace;
+    word-break: break-all;
+    line-height: 1.5;
+  }
+  .root-changed { animation: flash-root 0.6s ease; }
+  @keyframes flash-root {
+    0%, 100% { border-color: var(--border); }
+    50% { border-color: var(--purple); background: #1a1040; }
+  }
+
+  /* ── Center panel: Data views ── */
+  .panel-data {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .tab-bar {
+    display: flex;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 0 16px;
+    gap: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .tab {
+    padding: 10px 16px;
+    cursor: pointer;
+    color: var(--text2);
+    font-size: 12px;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+    transition: all 0.15s;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+  .tab-content { flex: 1; overflow: hidden; display: none; }
+  .tab-content.active { display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ── Tables ── */
+  .table-wrap {
+    flex: 1;
+    overflow: auto;
+    padding: 12px 16px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12px;
+  }
+  thead { position: sticky; top: 0; z-index: 10; }
+  th {
+    background: var(--surface2);
+    color: var(--text2);
+    padding: 6px 12px;
+    text-align: left;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    white-space: nowrap;
+  }
+  td {
+    padding: 5px 12px;
+    border-bottom: 1px solid #1c2128;
+    color: var(--text2);
+    font-size: 11px;
+    vertical-align: top;
+  }
+  tr.highlight td {
+    background: #1c2d3a;
+    color: var(--text);
+  }
+  tr.highlight-set td { background: #0d2218; color: var(--text); }
+  tr.highlight-del td { background: #2d1215; color: var(--text); }
+  tr.highlight-set td .hash { color: var(--green) !important; }
+  tr.highlight-del td .hash { color: var(--pink) !important; }
+  .hash { color: var(--orange); font-family: monospace; }
+  .null-val { color: var(--text3); font-style: italic; }
+  .deleted-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #2d1215;
+    color: var(--pink);
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  .active-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #0d2218;
+    color: var(--green);
+    border-radius: 3px;
+    font-size: 10px;
+  }
+  .fresh-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    background: #0c1a2e;
+    color: var(--blue);
+    border-radius: 3px;
+    font-size: 10px;
+  }
+
+  /* ── Shard selector ── */
+  .shard-selector {
+    display: flex;
+    gap: 6px;
+    padding: 8px 16px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    scrollbar-width: none;
+    flex-wrap: wrap;
+  }
+  .shard-btn {
+    padding: 3px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface2);
+    color: var(--text3);
+    cursor: pointer;
+    font-size: 11px;
+    transition: all 0.15s;
+  }
+  .shard-btn:hover { border-color: var(--blue); color: var(--text); }
+  .shard-btn.active { background: #0c1a2e; border-color: var(--blue); color: var(--blue); }
+  .shard-btn.has-data { color: var(--text2); }
+  .shard-btn.changed { border-color: var(--green); color: var(--green); background: #0d2218; }
+
+  /* ── Merkle tree visualization ── */
+  .tree-viz-wrap {
+    flex: 1;
+    overflow: auto;
+    padding: 16px;
+  }
+  .tree-svg-container {
+    min-width: 500px;
+    width: 100%;
+  }
+  .tree-node circle {
+    stroke: var(--border);
+    stroke-width: 1.5;
+    fill: var(--surface2);
+    transition: all 0.3s;
+  }
+  .tree-node.highlighted circle { stroke: var(--orange); fill: #2a1d08; }
+  .tree-node.root-node circle { stroke: var(--purple); fill: #1a0e2e; }
+  .tree-node text { fill: var(--text3); font-size: 9px; text-anchor: middle; }
+  .tree-edge { stroke: var(--border); stroke-width: 1; fill: none; }
+
+  /* ── Upper tree panel ── */
+  .upper-tree-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 8px;
+    padding: 12px 16px;
+    overflow-y: auto;
+    flex: 1;
+  }
+  .upper-node {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-size: 11px;
+    transition: all 0.3s;
+  }
+  .upper-node.root { border-color: var(--purple); background: #1a0e2e; }
+  .upper-node.changed { border-color: var(--green); animation: node-flash 0.5s ease; }
+  @keyframes node-flash {
+    0%, 100% { background: var(--surface2); }
+    50% { background: #0d2218; }
+  }
+  .upper-node .node-idx { color: var(--text3); font-size: 10px; margin-bottom: 3px; }
+  .upper-node .node-hash { color: var(--orange); font-family: monospace; word-break: break-all; line-height: 1.4; }
+  .upper-node .node-children { color: var(--text3); font-size: 10px; margin-top: 3px; }
+
+  /* ── Global state timeline ── */
+  .global-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+  }
+  .global-item {
+    display: flex;
+    gap: 12px;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    transition: all 0.3s;
+    align-items: flex-start;
+  }
+  .global-item.current { border-color: var(--blue); background: #0c1a2e; }
+  .global-item.future { opacity: 0.3; }
+  .global-step-num {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    color: var(--text3);
+    flex-shrink: 0;
+  }
+  .global-item.current .global-step-num {
+    background: var(--blue);
+    color: white;
+    border-color: var(--blue);
+  }
+  .global-item-body { flex: 1; min-width: 0; }
+  .global-item-op {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+  .global-item-root {
+    color: var(--purple);
+    font-family: monospace;
+    font-size: 10px;
+    word-break: break-all;
+    margin-top: 4px;
+  }
+  .block-tag {
+    padding: 1px 7px;
+    border-radius: 3px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text3);
+    font-size: 10px;
+  }
+
+  /* ── Twig tree panel ── */
+  .twig-canvas-wrap {
+    flex: 1;
+    overflow: auto;
+    padding: 16px;
+  }
+  .twig-tree-container {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .twig-card {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    transition: all 0.3s;
+  }
+  .twig-card.active-shard { border-color: var(--orange); }
+  .twig-card h4 {
+    font-size: 12px;
+    color: var(--text2);
+    margin-bottom: 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .twig-slots {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+  }
+  .twig-slot {
+    width: 28px;
+    height: 28px;
+    border-radius: 3px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8px;
+    color: var(--text3);
+    cursor: default;
+    transition: all 0.3s;
+    position: relative;
+  }
+  .twig-slot.filled { background: #0d2218; border-color: #1e4520; color: var(--green); }
+  .twig-slot.deleted { background: #2d1215; border-color: #3d1212; color: var(--pink); }
+  .twig-slot.sentinel { background: #0c1a2e; border-color: #1f3050; color: var(--blue); }
+  .twig-slot.new-entry { animation: slot-pop 0.5s ease; }
+  @keyframes slot-pop {
+    0% { transform: scale(0.5); opacity: 0; }
+    70% { transform: scale(1.2); }
+    100% { transform: scale(1); opacity: 1; }
+  }
+  .twig-slot:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 32px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: #2d333b;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 10px;
+    white-space: pre;
+    z-index: 300;
+    color: var(--text);
+    pointer-events: none;
+    min-width: 160px;
+  }
+
+  /* ── Animation overlay ── */
+  .step-flash {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    z-index: 1000;
+    opacity: 0;
+  }
+  .step-flash.set-flash { background: radial-gradient(circle at 50% 50%, rgba(63,185,80,0.08) 0%, transparent 70%); }
+  .step-flash.del-flash { background: radial-gradient(circle at 50% 50%, rgba(248,81,73,0.08) 0%, transparent 70%); }
+  .step-flash.animate { animation: flash-overlay 0.4s ease; }
+  @keyframes flash-overlay {
+    0% { opacity: 0; } 30% { opacity: 1; } 100% { opacity: 0; }
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--text3); }
+
+  .empty-hint {
+    color: var(--text3);
+    text-align: center;
+    padding: 40px;
+    font-size: 12px;
+  }
+
+  .diff-badge {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 600;
+    margin-left: 4px;
+  }
+  .diff-badge.new { background: #0d2a10; color: var(--green); }
+  .diff-badge.changed { background: #2a1d08; color: var(--orange); }
+  .diff-badge.removed { background: #2d1215; color: var(--pink); }
+</style>
+</head>
+<body>
+
+<!-- Flash overlay -->
+<div class="step-flash" id="stepFlash"></div>
+
+<!-- Upload zone -->
+<div class="upload-zone" id="uploadZone">
+  <div class="upload-box" id="uploadBox">
+    <div class="icon">📁</div>
+    <h2>拖入 QMDB data/ 目录中的所有 CSV 文件</h2>
+    <p>支持同时选择多个文件<br>所有数据在本地处理，不上传服务器</p>
+    <button class="upload-btn" onclick="document.getElementById('fileInput').click()">选择文件</button>
+    <input type="file" id="fileInput" multiple accept=".csv">
+  </div>
+  <div class="file-hints">
+    需要的文件：<code>global_state.csv</code>、<code>entries_shard_N.csv</code>、
+    <code>index_shard_N.csv</code>、<code>twig_registry.csv</code>、
+    <code>upper_tree.csv</code>、<code>fresh_twig_shard_N.csv</code>
+    <br><br>先运行 <code>go run main.go</code> 生成 CSV 文件，然后选择 <code>data/</code> 目录下所有文件
+  </div>
+</div>
+
+<!-- Main App -->
+<div class="app" id="app">
+  <!-- Header -->
+  <div class="header">
+    <h1>⚡ QMDB 运行动画演示</h1>
+    <span class="header-sub">逐步可视化每个写操作对数据库状态的影响</span>
+    <button class="btn danger" onclick="resetApp()" style="margin-left:auto">↩ 重新加载</button>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls">
+    <button class="btn" id="btnFirst" onclick="goToStep(0)">⏮ 初始</button>
+    <button class="btn" id="btnPrev" onclick="prevStep()">◀ 上一步</button>
+    <button class="btn primary" id="btnPlay" onclick="togglePlay()">▶ 播放</button>
+    <button class="btn" id="btnNext" onclick="nextStep()">下一步 ▶</button>
+    <button class="btn" id="btnLast" onclick="goToStep(totalSteps-1)">末尾 ⏭</button>
+    <span class="speed-label">速度</span>
+    <select class="speed-select" id="speedSelect" onchange="updateSpeed()">
+      <option value="2000">0.5×</option>
+      <option value="1200" selected>1×</option>
+      <option value="600">2×</option>
+      <option value="300">4×</option>
+      <option value="100">8×</option>
+    </select>
+    <span class="step-counter">步骤 <strong id="stepDisplay">0</strong> / <strong id="totalDisplay">0</strong></span>
+  </div>
+
+  <!-- Progress + Timeline -->
+  <div class="timeline-wrap">
+    <div class="progress-bar-wrap" style="margin-bottom:8px">
+      <div class="progress-bar-fill" id="progressFill" style="width:0%"></div>
+    </div>
+    <div class="timeline" id="timeline"></div>
+  </div>
+
+  <!-- Content -->
+  <div class="content">
+    <!-- Left: narrative -->
+    <div class="panel-narrative">
+      <div class="panel-title">📋 当前步骤详情</div>
+      <div class="narrative-body" id="narrativeBody">
+        <div class="empty-hint">请点击播放或选择步骤</div>
+      </div>
+    </div>
+
+    <!-- Right: data tabs -->
+    <div class="panel-data">
+      <div class="tab-bar">
+        <div class="tab active" onclick="switchTab('global')">🌍 全局状态历史</div>
+        <div class="tab" onclick="switchTab('entries')">📝 Entry 日志</div>
+        <div class="tab" onclick="switchTab('index')">🔍 B-Tree 索引</div>
+        <div class="tab" onclick="switchTab('twig')">🌿 Twig 状态</div>
+        <div class="tab" onclick="switchTab('upper')">🌳 Upper Tree</div>
+      </div>
+
+      <!-- Global State Tab -->
+      <div class="tab-content active" id="tab-global">
+        <div class="global-list" id="globalList"></div>
+      </div>
+
+      <!-- Entries Tab -->
+      <div class="tab-content" id="tab-entries">
+        <div class="shard-selector" id="entriesShardSelector"></div>
+        <div class="table-wrap">
+          <table id="entriesTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>操作</th>
+                <th>Key (hex)</th>
+                <th>Value (hex)</th>
+                <th>NextKey</th>
+                <th>OldId</th>
+                <th>Block</th>
+                <th>Tx</th>
+              </tr>
+            </thead>
+            <tbody id="entriesBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Index Tab -->
+      <div class="tab-content" id="tab-index">
+        <div class="shard-selector" id="indexShardSelector"></div>
+        <div class="table-wrap">
+          <table id="indexTable">
+            <thead>
+              <tr>
+                <th>Key Prefix (9B)</th>
+                <th>Full Key (28B)</th>
+                <th>Entry ID</th>
+              </tr>
+            </thead>
+            <tbody id="indexBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Twig Tab -->
+      <div class="tab-content" id="tab-twig">
+        <div class="shard-selector" id="twigShardSelector"></div>
+        <div class="twig-canvas-wrap">
+          <div class="twig-tree-container" id="twigContainer"></div>
+        </div>
+      </div>
+
+      <!-- Upper Tree Tab -->
+      <div class="tab-content" id="tab-upper">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>节点索引</th><th>左子节点</th><th>右子节点</th><th>Hash</th></tr>
+            </thead>
+            <tbody id="upperBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════
+// CSV Parser
+// ═══════════════════════════════════════════════════════════════
+function parseCSV(text) {
+  const lines = text.trim().split('\n');
+  if (lines.length === 0) return { headers: [], rows: [] };
+  const headers = parseCSVLine(lines[0]);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const values = parseCSVLine(line);
+    const row = {};
+    headers.forEach((h, idx) => row[h] = values[idx] || '');
+    rows.push(row);
+  }
+  return { headers, rows };
+}
+
+function parseCSVLine(line) {
+  const result = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (c === '"') {
+      if (inQuotes && line[i+1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (c === ',' && !inQuotes) {
+      result.push(current);
+      current = '';
+    } else {
+      current += c;
+    }
+  }
+  result.push(current);
+  return result;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// App State
+// ═══════════════════════════════════════════════════════════════
+let allData = {
+  globalState: [],           // rows from global_state.csv
+  entriesByShard: {},        // shardId -> rows[]
+  indexByShard: {},          // shardId -> rows[]
+  twigRegistry: [],          // rows from twig_registry.csv
+  upperTree: [],             // rows from upper_tree.csv
+  freshTwigByShard: {},      // shardId -> rows[]
+};
+
+let currentStep = -1;
+let totalSteps = 0;
+let playTimer = null;
+let isPlaying = false;
+let playInterval = 1200;
+let selectedEntriesShard = 0;
+let selectedIndexShard = 0;
+let selectedTwigShard = -1; // -1 = current step's shard
+
+// ═══════════════════════════════════════════════════════════════
+// File Loading
+// ═══════════════════════════════════════════════════════════════
+const uploadBox = document.getElementById('uploadBox');
+const fileInput = document.getElementById('fileInput');
+
+uploadBox.addEventListener('dragover', e => { e.preventDefault(); uploadBox.classList.add('drag-over'); });
+uploadBox.addEventListener('dragleave', () => uploadBox.classList.remove('drag-over'));
+uploadBox.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadBox.classList.remove('drag-over');
+  loadFiles(e.dataTransfer.files);
+});
+fileInput.addEventListener('change', e => loadFiles(e.target.files));
+
+async function loadFiles(fileList) {
+  const files = Array.from(fileList);
+  const csvFiles = files.filter(f => f.name.endsWith('.csv'));
+  if (csvFiles.length === 0) {
+    alert('请选择 .csv 文件');
+    return;
+  }
+
+  // Reset
+  allData = { globalState: [], entriesByShard: {}, indexByShard: {}, twigRegistry: [], upperTree: [], freshTwigByShard: {} };
+
+  const reads = csvFiles.map(f => f.text().then(text => ({ name: f.name, text })));
+  const results = await Promise.all(reads);
+
+  for (const { name, text } of results) {
+    const { rows } = parseCSV(text);
+    if (name === 'global_state.csv') {
+      allData.globalState = rows;
+    } else if (name === 'twig_registry.csv') {
+      allData.twigRegistry = rows;
+    } else if (name === 'upper_tree.csv') {
+      allData.upperTree = rows;
+    } else if (name.startsWith('entries_shard_')) {
+      const sid = parseInt(name.replace('entries_shard_', '').replace('.csv', ''));
+      allData.entriesByShard[sid] = rows;
+    } else if (name.startsWith('index_shard_')) {
+      const sid = parseInt(name.replace('index_shard_', '').replace('.csv', ''));
+      allData.indexByShard[sid] = rows;
+    } else if (name.startsWith('fresh_twig_shard_')) {
+      const sid = parseInt(name.replace('fresh_twig_shard_', '').replace('.csv', ''));
+      allData.freshTwigByShard[sid] = rows;
+    }
+  }
+
+  if (allData.globalState.length === 0) {
+    alert('未找到 global_state.csv，请确保已选择正确的文件');
+    return;
+  }
+
+  initApp();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// App Initialization
+// ═══════════════════════════════════════════════════════════════
+function initApp() {
+  totalSteps = allData.globalState.length;
+  document.getElementById('uploadZone').style.display = 'none';
+  document.getElementById('app').classList.add('visible');
+
+  document.getElementById('totalDisplay').textContent = totalSteps;
+
+  buildTimeline();
+  buildShardSelectors();
+  goToStep(0);
+}
+
+function resetApp() {
+  stopPlay();
+  currentStep = -1;
+  document.getElementById('app').classList.remove('visible');
+  document.getElementById('uploadZone').style.display = 'flex';
+  fileInput.value = '';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Timeline
+// ═══════════════════════════════════════════════════════════════
+function buildTimeline() {
+  const tl = document.getElementById('timeline');
+  tl.innerHTML = '';
+  allData.globalState.forEach((row, i) => {
+    const div = document.createElement('div');
+    const op = row.operation || 'Init';
+    div.className = `timeline-step op-${op}`;
+    div.textContent = i + 1;
+    div.setAttribute('data-step', i);
+
+    const tip = document.createElement('div');
+    tip.className = 'step-tooltip';
+    const keyShort = (row.key_hex || '').substring(0, 12) + '…';
+    tip.innerHTML = `<strong>Step ${i+1}</strong><br>Op: ${op}<br>Block: ${row.block_height}<br>Shard: ${row.shard_id}<br>Key: ${keyShort}`;
+    div.appendChild(tip);
+
+    div.addEventListener('click', () => goToStep(i));
+    tl.appendChild(div);
+  });
+}
+
+function updateTimeline(step) {
+  document.querySelectorAll('.timeline-step').forEach((el, i) => {
+    el.classList.remove('active', 'visited');
+    if (i === step) el.classList.add('active');
+    else if (i < step) el.classList.add('visited');
+  });
+  // Scroll active step into view
+  const active = document.querySelector('.timeline-step.active');
+  if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shard selectors
+// ═══════════════════════════════════════════════════════════════
+function buildShardSelectors() {
+  const shards = Object.keys(allData.entriesByShard).map(Number).sort((a,b)=>a-b);
+
+  ['entriesShardSelector', 'indexShardSelector', 'twigShardSelector'].forEach(id => {
+    const wrap = document.getElementById(id);
+    wrap.innerHTML = '';
+    if (id === 'twigShardSelector') {
+      const allBtn = document.createElement('div');
+      allBtn.className = 'shard-btn active';
+      allBtn.textContent = '全部';
+      allBtn.dataset.shard = '-1';
+      allBtn.onclick = () => selectTwigShard(-1);
+      wrap.appendChild(allBtn);
+    }
+    shards.forEach(sid => {
+      const btn = document.createElement('div');
+      btn.className = 'shard-btn has-data';
+      btn.textContent = `Shard ${sid}`;
+      btn.dataset.shard = sid;
+      if (id === 'entriesShardSelector' && sid === selectedEntriesShard) btn.classList.add('active');
+      if (id === 'indexShardSelector' && sid === selectedIndexShard) btn.classList.add('active');
+      btn.onclick = () => {
+        if (id === 'entriesShardSelector') selectEntriesShard(sid);
+        if (id === 'indexShardSelector') selectIndexShard(sid);
+        if (id === 'twigShardSelector') selectTwigShard(sid);
+      };
+      wrap.appendChild(btn);
+    });
+  });
+}
+
+function selectEntriesShard(sid) {
+  selectedEntriesShard = sid;
+  document.querySelectorAll('#entriesShardSelector .shard-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.shard) === sid);
+  });
+  renderEntriesTab();
+}
+function selectIndexShard(sid) {
+  selectedIndexShard = sid;
+  document.querySelectorAll('#indexShardSelector .shard-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.shard) === sid);
+  });
+  renderIndexTab();
+}
+function selectTwigShard(sid) {
+  selectedTwigShard = sid;
+  document.querySelectorAll('#twigShardSelector .shard-btn').forEach(b => {
+    b.classList.toggle('active', parseInt(b.dataset.shard) === sid);
+  });
+  renderTwigTab();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Navigation
+// ═══════════════════════════════════════════════════════════════
+function goToStep(step) {
+  if (step < 0 || step >= totalSteps) return;
+  const prevStep = currentStep;
+  currentStep = step;
+
+  updateTimeline(step);
+  document.getElementById('stepDisplay').textContent = step + 1;
+  document.getElementById('progressFill').style.width = `${((step+1)/totalSteps)*100}%`;
+
+  const row = allData.globalState[step];
+  triggerFlash(row.operation);
+
+  renderNarrative(row, step);
+  renderGlobalTab(step);
+  renderEntriesTab();
+  renderIndexTab();
+  renderTwigTab();
+  renderUpperTab();
+
+  // Auto-highlight the current step's shard in selectors
+  const sid = parseInt(row.shard_id);
+  highlightChangedShard(sid);
+}
+
+function highlightChangedShard(sid) {
+  ['entriesShardSelector', 'indexShardSelector', 'twigShardSelector'].forEach(id => {
+    document.querySelectorAll(`#${id} .shard-btn`).forEach(b => {
+      b.classList.remove('changed');
+      if (parseInt(b.dataset.shard) === sid) b.classList.add('changed');
+    });
+  });
+}
+
+function prevStep() { goToStep(currentStep - 1); }
+function nextStep() { goToStep(currentStep + 1); }
+
+function togglePlay() {
+  if (isPlaying) stopPlay();
+  else startPlay();
+}
+
+function startPlay() {
+  if (currentStep >= totalSteps - 1) goToStep(0);
+  isPlaying = true;
+  document.getElementById('btnPlay').textContent = '⏸ 暂停';
+  playTimer = setInterval(() => {
+    if (currentStep >= totalSteps - 1) { stopPlay(); return; }
+    nextStep();
+  }, playInterval);
+}
+
+function stopPlay() {
+  isPlaying = false;
+  clearInterval(playTimer);
+  document.getElementById('btnPlay').textContent = '▶ 播放';
+}
+
+function updateSpeed() {
+  playInterval = parseInt(document.getElementById('speedSelect').value);
+  if (isPlaying) { stopPlay(); startPlay(); }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Flash Effect
+// ═══════════════════════════════════════════════════════════════
+function triggerFlash(op) {
+  const el = document.getElementById('stepFlash');
+  el.className = 'step-flash';
+  void el.offsetWidth;
+  if (op === 'Delete') el.className = 'step-flash del-flash animate';
+  else el.className = 'step-flash set-flash animate';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Narrative Panel
+// ═══════════════════════════════════════════════════════════════
+function renderNarrative(row, step) {
+  const op = row.operation || 'Init';
+  const key = row.key_hex || '';
+  const shard = row.shard_id;
+  const block = row.block_height;
+  const tx = row.tx_index;
+  const root = row.state_root_hex || '';
+  const ts = row.timestamp || '';
+
+  // Get entries for this shard up to this step's key
+  const shardEntries = allData.entriesByShard[parseInt(shard)] || [];
+  const thisEntry = shardEntries.find(e => e.key_hex === key);
+
+  const prevRoot = step > 0 ? allData.globalState[step-1].state_root_hex : null;
+  const rootChanged = prevRoot !== root;
+
+  const opLabel = op === 'Set' ? '✍ Set / Insert / Update' : op === 'Delete' ? '🗑 Delete' : '⚙ Init';
+  const opClass = op === 'Set' ? 'Set' : op === 'Delete' ? 'Delete' : 'Init';
+
+  let narrative = `
+    <span class="op-badge ${opClass}">${opLabel}</span>
+    <div class="narrative-section">
+      <h3>操作信息</h3>
+      <div class="kv-row"><span class="kv-label">Block</span><span class="kv-value green">${block}</span></div>
+      <div class="kv-row"><span class="kv-label">Tx Index</span><span class="kv-value blue">${tx}</span></div>
+      <div class="kv-row"><span class="kv-label">Shard</span><span class="kv-value orange">${shard}</span></div>
+      <div class="kv-row"><span class="kv-label">Key</span><span class="kv-value mono">${shortHash(key)}</span></div>
+    </div>`;
+
+  if (thisEntry) {
+    const valueHex = thisEntry.value_hex || '';
+    const balanceInfo = decodeBalance(valueHex);
+    narrative += `
+    <div class="narrative-section">
+      <h3>Entry 详情</h3>
+      <div class="kv-row"><span class="kv-label">Entry ID</span><span class="kv-value purple">${thisEntry.entry_id}</span></div>
+      <div class="kv-row"><span class="kv-label">OldId</span><span class="kv-value mono">${thisEntry.old_id || 'null'}</span></div>
+      <div class="kv-row"><span class="kv-label">NextKey</span><span class="kv-value mono">${shortHash(thisEntry.next_key_hex)}</span></div>
+      ${balanceInfo ? `<div class="kv-row"><span class="kv-label">Balance</span><span class="kv-value green">${balanceInfo}</span></div>` : ''}
+      <div class="kv-row"><span class="kv-label">Deleted</span><span class="kv-value ${thisEntry.is_deleted==='true'?'pink':'green'}">${thisEntry.is_deleted}</span></div>
+    </div>`;
+  }
+
+  narrative += `
+    <div class="narrative-section">
+      <h3>Twig / Merkle</h3>`;
+
+  const twigRow = allData.twigRegistry.find(t => t.shard_id === shard);
+  if (twigRow) {
+    narrative += `
+      <div class="kv-row"><span class="kv-label">Twig ID</span><span class="kv-value orange">${twigRow.twig_id}</span></div>
+      <div class="kv-row"><span class="kv-label">Status</span><span class="kv-value blue">${twigRow.status}</span></div>
+      <div class="kv-row"><span class="kv-label">Active</span><span class="kv-value green">${twigRow.active_count}</span></div>`;
+  }
+  narrative += '</div>';
+
+  // State root
+  const rootBox = `
+    <div class="state-root-box ${rootChanged ? 'root-changed' : ''}">
+      <div class="label">State Root${rootChanged ? ' 🔄 已更新' : ''}</div>
+      <div class="hash">${root}</div>
+    </div>`;
+
+  narrative += rootBox;
+
+  // What happened explanation
+  const explanation = explainOperation(op, key, shard, block, tx, step);
+  narrative += `
+    <div class="narrative-section">
+      <h3>📌 这一步做了什么</h3>
+      <div style="color:var(--text2);line-height:1.8;font-size:12px">${explanation}</div>
+    </div>`;
+
+  document.getElementById('narrativeBody').innerHTML = narrative;
+}
+
+function explainOperation(op, key, shard, block, tx, step) {
+  const keyS = shortHash(key);
+  const shardEntries = allData.entriesByShard[parseInt(shard)] || [];
+  const totalNow = shardEntries.length;
+
+  if (op === 'Set') {
+    // Check if it's an update (key appears multiple times in entries)
+    const sameKeyEntries = shardEntries.filter(e => e.key_hex === key && !e.is_deleted);
+    const isUpdate = sameKeyEntries.length > 1;
+    if (isUpdate) {
+      return `在 Block <b style="color:var(--green)">${block}</b>（Tx ${tx}）对 Shard <b style="color:var(--orange)">${shard}</b> 执行 <b>Update</b> 操作：<br>
+        键 <code style="color:var(--orange)">${keyS}</code> 已有旧版本，追加新 Entry 并通过 <code>OldId</code> 链接历史版本，同时更新 B-Tree 索引指向新 Entry。<br>
+        Fresh Twig 增加一个新叶节点，Merkle 路径重新哈希，State Root 变更。`;
+    } else {
+      return `在 Block <b style="color:var(--green)">${block}</b>（Tx ${tx}）对 Shard <b style="color:var(--orange)">${shard}</b> 执行 <b>Insert</b> 操作：<br>
+        键 <code style="color:var(--orange)">${keyS}</code> 第一次写入，追加新 Entry 到 Append Log（entry_id = ${totalNow-1}）。<br>
+        B-Tree 索引插入新的 key→entryID 映射。Fresh Twig 分配一个新叶子槽位，<br>
+        Merkle 路径从叶子到根全部重新哈希，最终更新 Upper Tree 中对应 Shard 的根，State Root 变更。`;
+    }
+  } else if (op === 'Delete') {
+    return `在 Block <b style="color:var(--pink)">${block}</b>（Tx ${tx}）对 Shard <b style="color:var(--orange)">${shard}</b> 执行 <b>Delete</b> 操作：<br>
+      追加一条 <code>is_deleted=true</code> 的 Tombstone Entry，B-Tree 索引中该键被标记删除。<br>
+      NextKey 链表重新缝合（前驱节点的 NextKey 指向后继节点），保持有序链表的完整性以支持非存在性证明。<br>
+      Twig 中对应槽位哈希清零，Merkle 路径重新计算，State Root 变更。`;
+  }
+  return `系统初始化：在所有 16 个 Shard 中插入 MIN/MAX 哨兵节点，建立有序链表的边界，State Root 计算完成。`;
+}
+
+function decodeBalance(valueHex) {
+  if (!valueHex || valueHex.length < 16) return null;
+  try {
+    // First 8 bytes little-endian uint64
+    let val = BigInt(0);
+    for (let i = 0; i < 8; i++) {
+      const byte = parseInt(valueHex.substr(i * 2, 2), 16);
+      val |= BigInt(byte) << BigInt(i * 8);
+    }
+    if (val > 0n && val < 1000000n) return val.toString() + ' (little-endian uint64)';
+    return null;
+  } catch { return null; }
+}
+
+function shortHash(hex) {
+  if (!hex || hex === 'null') return '<span class="null-val">null</span>';
+  if (hex.length > 16) return `<span class="hash">${hex.substring(0, 16)}…</span>`;
+  return `<span class="hash">${hex}</span>`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Global State Tab
+// ═══════════════════════════════════════════════════════════════
+function renderGlobalTab(step) {
+  const list = document.getElementById('globalList');
+  list.innerHTML = '';
+  allData.globalState.forEach((row, i) => {
+    const div = document.createElement('div');
+    const isCurrent = i === step;
+    const isFuture = i > step;
+    div.className = `global-item${isCurrent?' current':''}${isFuture?' future':''}`;
+
+    const op = row.operation || 'Init';
+    const opColors = { Set: 'var(--green)', Delete: 'var(--pink)', Init: 'var(--blue)' };
+    const opColor = opColors[op] || 'var(--text2)';
+    const keyShort = (row.key_hex || '').substring(0, 14) + '…';
+
+    div.innerHTML = `
+      <div class="global-step-num">${i+1}</div>
+      <div class="global-item-body">
+        <div class="global-item-op">
+          <b style="color:${opColor}">${op}</b>
+          <span class="block-tag">Block ${row.block_height}</span>
+          <span style="color:var(--text3);font-size:10px">Tx ${row.tx_index}</span>
+          <span style="color:var(--orange);font-size:10px">Shard ${row.shard_id}</span>
+        </div>
+        <div style="color:var(--text3);font-size:10px;font-family:monospace">Key: ${keyShort}</div>
+        <div class="global-item-root">${row.state_root_hex || ''}</div>
+      </div>`;
+    div.addEventListener('click', () => goToStep(i));
+    list.appendChild(div);
+  });
+
+  // Scroll current into view
+  const current = list.querySelector('.current');
+  if (current) current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Entries Tab
+// ═══════════════════════════════════════════════════════════════
+function renderEntriesTab() {
+  const tbody = document.getElementById('entriesBody');
+  tbody.innerHTML = '';
+  const rows = allData.entriesByShard[selectedEntriesShard] || [];
+  const currentRow = currentStep >= 0 ? allData.globalState[currentStep] : null;
+  const currentKey = currentRow ? currentRow.key_hex : null;
+  const currentShard = currentRow ? parseInt(currentRow.shard_id) : -1;
+
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    const isHighlight = currentShard === selectedEntriesShard && row.key_hex === currentKey;
+    if (isHighlight) {
+      tr.className = row.is_deleted === 'true' ? 'highlight-del' : 'highlight-set';
+    }
+    const valueHex = row.value_hex || '';
+    const valueDisplay = valueHex.length > 20 ? valueHex.substring(0, 20) + '…' : (valueHex || '<span class="null-val">empty</span>');
+    const isDeleted = row.is_deleted === 'true';
+
+    tr.innerHTML = `
+      <td><span class="hash">${row.entry_id}</span></td>
+      <td>${isDeleted ? '<span class="deleted-badge">DELETED</span>' : '<span class="active-badge">ACTIVE</span>'}</td>
+      <td><span class="hash" title="${row.key_hex}">${(row.key_hex||'').substring(0,16)}…</span></td>
+      <td><span title="${valueHex}" style="color:var(--text2)">${valueDisplay}</span></td>
+      <td><span class="hash" title="${row.next_key_hex}">${(row.next_key_hex||'').substring(0,12)}…</span></td>
+      <td style="color:var(--text3)">${row.old_id === 'null' || !row.old_id ? '<span class="null-val">—</span>' : row.old_id}</td>
+      <td style="color:var(--green)">${row.block_height}</td>
+      <td style="color:var(--text3)">${row.tx_index}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Index Tab
+// ═══════════════════════════════════════════════════════════════
+function renderIndexTab() {
+  const tbody = document.getElementById('indexBody');
+  tbody.innerHTML = '';
+  const rows = allData.indexByShard[selectedIndexShard] || [];
+  const currentRow = currentStep >= 0 ? allData.globalState[currentStep] : null;
+  const currentKey = currentRow ? currentRow.key_hex : null;
+  const currentShard = currentRow ? parseInt(currentRow.shard_id) : -1;
+
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    const isHighlight = currentShard === selectedIndexShard && row.full_key_hex === currentKey;
+    if (isHighlight) tr.className = 'highlight';
+
+    tr.innerHTML = `
+      <td><span class="hash">${row.key_prefix_hex || ''}</span></td>
+      <td><span class="hash" title="${row.full_key_hex}">${(row.full_key_hex||'').substring(0,16)}…</span></td>
+      <td><span style="color:var(--purple)">${row.entry_id}</span></td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Twig Tab
+// ═══════════════════════════════════════════════════════════════
+function renderTwigTab() {
+  const container = document.getElementById('twigContainer');
+  container.innerHTML = '';
+
+  const currentRow = currentStep >= 0 ? allData.globalState[currentStep] : null;
+  const activeShard = currentRow ? parseInt(currentRow.shard_id) : -1;
+
+  // Get shard IDs to show
+  let shardIds;
+  if (selectedTwigShard === -1) {
+    shardIds = Object.keys(allData.entriesByShard).map(Number).sort((a,b)=>a-b);
+  } else {
+    shardIds = [selectedTwigShard];
+  }
+
+  shardIds.forEach(sid => {
+    const entries = allData.entriesByShard[sid] || [];
+    if (entries.length === 0) return;
+
+    const twigInfo = allData.twigRegistry.find(t => parseInt(t.shard_id) === sid);
+    const freshNodes = allData.freshTwigByShard[sid] || [];
+
+    const card = document.createElement('div');
+    card.className = `twig-card${sid === activeShard ? ' active-shard' : ''}`;
+
+    const statusBadge = twigInfo ? `<span class="fresh-badge">${twigInfo.status}</span>` : '';
+    const activeCount = twigInfo ? twigInfo.active_count : '?';
+    const rootHash = twigInfo ? (twigInfo.root_hash_hex || '').substring(0, 20) + '…' : '—';
+
+    card.innerHTML = `
+      <h4>
+        Shard ${sid} ${statusBadge}
+        <span style="color:var(--text3);font-size:10px">Active: ${activeCount} / Twig Root: <span style="color:var(--orange)">${rootHash}</span></span>
+      </h4>
+      <div class="twig-slots" id="twigSlots-${sid}"></div>
+      <div style="margin-top:10px;font-size:10px;color:var(--text3)">
+        Merkle 节点数: ${freshNodes.length} &nbsp;|&nbsp;
+        内部哈希 (type=internal/twig_root): ${freshNodes.filter(n=>n.type!=='leaf').length}
+      </div>`;
+
+    const slotsDiv = card.querySelector(`#twigSlots-${sid}`);
+
+    // Determine active slots from entries
+    const slotMap = {};
+    entries.forEach(e => {
+      if (!e.entry_id) return;
+      const entryId = parseInt(e.entry_id);
+      const slot = entryId % 2048; // TwigSize
+      const isSentinel = e.key_hex === 'f'.repeat(56) || e.key_hex === '0'.repeat(56);
+      slotMap[slot] = {
+        type: e.is_deleted === 'true' ? 'deleted' : (isSentinel ? 'sentinel' : 'filled'),
+        key: e.key_hex,
+        entryId,
+        block: e.block_height,
+        isDeleted: e.is_deleted === 'true'
+      };
+    });
+
+    // Show first 32 slots (or all used)
+    const usedSlots = Object.keys(slotMap).map(Number).sort((a,b)=>a-b);
+    const maxSlot = Math.max(...usedSlots, 3);
+
+    for (let i = 0; i <= maxSlot; i++) {
+      const slotDiv = document.createElement('div');
+      const info = slotMap[i];
+      if (info) {
+        slotDiv.className = `twig-slot ${info.type}`;
+        if (currentRow && parseInt(currentRow.shard_id) === sid) {
+          const currentKey = currentRow.key_hex;
+          if (info.key === currentKey) slotDiv.classList.add('new-entry');
+        }
+        slotDiv.setAttribute('data-tooltip',
+          `Slot ${i}\nEntry #${info.entryId}\nKey: ${info.key.substring(0,16)}…\nBlock: ${info.block}\n${info.isDeleted ? '🗑 DELETED' : '✓ ACTIVE'}`);
+        slotDiv.textContent = i;
+      } else {
+        slotDiv.className = 'twig-slot';
+        slotDiv.textContent = i;
+      }
+      slotsDiv.appendChild(slotDiv);
+    }
+
+    container.appendChild(card);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Upper Tree Tab
+// ═══════════════════════════════════════════════════════════════
+function renderUpperTab() {
+  const tbody = document.getElementById('upperBody');
+  tbody.innerHTML = '';
+  const currentRow = currentStep >= 0 ? allData.globalState[currentStep] : null;
+  const currentRoot = currentRow ? currentRow.state_root_hex : null;
+
+  // Sort by heap index
+  const rows = [...allData.upperTree].sort((a,b) => parseInt(a.heap_index)-parseInt(b.heap_index));
+
+  rows.forEach(row => {
+    const tr = document.createElement('tr');
+    const isRoot = row.heap_index === '1';
+    const hashMatchesRoot = currentRoot && row.hash_hex === currentRoot;
+    if (isRoot || hashMatchesRoot) tr.className = 'highlight';
+
+    const label = isRoot ? '<span class="active-badge">ROOT</span>' : '';
+    tr.innerHTML = `
+      <td>${label} <span style="color:var(--purple)">${row.heap_index}</span></td>
+      <td style="color:var(--text3)">${row.left_child}</td>
+      <td style="color:var(--text3)">${row.right_child}</td>
+      <td><span class="hash" title="${row.hash_hex}">${(row.hash_hex||'').substring(0,24)}…</span></td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tab switching
+// ═══════════════════════════════════════════════════════════════
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    const names = ['global', 'entries', 'index', 'twig', 'upper'];
+    t.classList.toggle('active', names[i] === name);
+  });
+  document.querySelectorAll('.tab-content').forEach(c => {
+    c.classList.toggle('active', c.id === `tab-${name}`);
+  });
+}
+</script>
+</body>
+</html>
